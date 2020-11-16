@@ -139,7 +139,7 @@ class SlamBackend:
         # prior for first pose.
         t_xy_e = prog.NewContinuousVariables(t + 1, 2, "t_xy_e")
         prog.AddQuadraticCost(
-            ((t_xy_e[0] - self.t_xy_e_dict[0]) ** 2).sum())
+            ((t_xy_e[0] - self.t_xy_e_dict[0]) ** 2).sum() * 10000)
 
         # landmarks
         n_l = len(self.landmark_visibility)
@@ -147,20 +147,34 @@ class SlamBackend:
         s_l = prog.NewContinuousVariables(n_l, "s_l")  # slack variables.
 
         indices_landmark = []
+
         for i_k, (k, t_dict) in enumerate(self.landmark_visibility.items()):
             # print(i_k, k, pose_list)
             indices_landmark.append(k)
             for i_t, d_l_measured in t_dict.items():
-                e2 = d_l_measured ** 2 - (
-                        (t_xy_e[i_t] - l_xy_e[i_k]) ** 2).sum()
-                prog.AddConstraint(s_l[i_k] >= e2)
-                prog.AddConstraint(s_l[i_k] >= -e2)
+                # def d_cost(z):
+                #     t_xy_e_i = z[:2]
+                #     l_xy_e_i = z[2:]
+                #     e = d_l_measured**2 - ((t_xy_e_i - l_xy_e_i) ** 2).sum()
+                #     e /= self.sigma_range ** 2
+                #     return e**2
+                #
+                # prog.AddCost(d_cost,
+                #              vars=[t_xy_e[i_t][0], t_xy_e[i_t][1],
+                #                    l_xy_e[i_k][0], l_xy_e[i_k][1]])
+                t_xy_e_i = t_xy_e[i_t]
+                l_xy_e_i = l_xy_e[i_k]
+                e = d_l_measured ** 2 - ((t_xy_e_i - l_xy_e_i) ** 2).sum()
+                e /= self.sigma_range ** 2
+                prog.AddConstraint(s_l[i_k] >= e)
+                prog.AddConstraint(s_l[i_k] >= -e)
+
                 prog.AddCost(s_l[i_k])
 
         # odometry
         for i, odometry_measurement in self.odometry_measurements.items():
             dt = t_xy_e[i] - t_xy_e[i-1] - odometry_measurement
-            prog.AddCost((dt**2).sum())
+            prog.AddCost((dt**2).sum() / self.sigma_odometry ** 2)
 
         # initial guess
         for i in range(len(self.t_xy_e_dict)):
@@ -172,6 +186,7 @@ class SlamBackend:
 
         # %% save solution
         result = self.solver.Solve(prog)
+        print(result.get_solution_result())
         assert result.get_solution_result() == mp.SolutionResult.kSolutionFound
 
         t_xy_e_values = result.GetSolution(t_xy_e)
@@ -191,8 +206,6 @@ class SlamBackend:
         print("landmark estimates\n", l_xy_e_values)
 
 
-
-
 if __name__ == "__main__":
     #%%
     t_xy = np.zeros((3, 2))
@@ -208,51 +221,18 @@ if __name__ == "__main__":
 
 
 #%% first measurement
-    t = 0
-    idx_visible_l_list, d_l_measured_list = \
-        frontend.get_range_measurements(t_xy[t])
-    backend.update_landmark_measurements(
-        t, idx_visible_l_list, d_l_measured_list)
+    for t in range(len(t_xy)):
+        idx_visible_l_list, d_l_measured_list = \
+            frontend.get_range_measurements(t_xy[t])
+        backend.update_landmark_measurements(
+            t, idx_visible_l_list, d_l_measured_list)
 
-#%%
-    backend.run_bundle_adjustment()
-    print("ture robot position: ", t_xy[t])
-    print("true landmark positions\n",
-          frontend.l_xy[list(backend.landmark_visibility.keys())])
+        if t > 0:
+            odometry_measurement = frontend.get_odometry_measurements(
+                t_xy=t_xy[t], t_xy_previous=t_xy[t - 1])
+            backend.update_odometry_measruements(t, odometry_measurement)
 
-#%% second measurement
-    t = 1
-    odometry_measurement = frontend.get_odometry_measurements(
-        t_xy=t_xy[t], t_xy_previous=t_xy[t-1])
-    backend.update_odometry_measruements(t, odometry_measurement)
-
-    idx_visible_l_list, d_l_measured_list = \
-        frontend.get_range_measurements(t_xy[t])
-    backend.update_landmark_measurements(
-        t, idx_visible_l_list, d_l_measured_list)
-
-#%%
-    backend.run_bundle_adjustment()
-    print("ture robot position: ", t_xy[t])
-    print("true landmark positions\n",
-          frontend.l_xy[list(backend.landmark_visibility.keys())])
-
-
-#%% third measurement
-    t = 2
-    odometry_measurement = frontend.get_odometry_measurements(
-        t_xy=t_xy[t], t_xy_previous=t_xy[t-1])
-    backend.update_odometry_measruements(t, odometry_measurement)
-
-    idx_visible_l_list, d_l_measured_list = \
-        frontend.get_range_measurements(t_xy[t])
-    backend.update_landmark_measurements(
-        t, idx_visible_l_list, d_l_measured_list)
-
-#%%
-    backend.run_bundle_adjustment()
-    print("ture robot position: ", t_xy[t])
-    print("true landmark positions\n",
-          frontend.l_xy[list(backend.landmark_visibility.keys())])
-
-
+        backend.run_bundle_adjustment()
+        print("ture robot position: ", t_xy[t])
+        print("true landmark positions\n",
+              frontend.l_xy[list(backend.landmark_visibility.keys())])
