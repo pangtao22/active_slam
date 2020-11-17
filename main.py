@@ -107,6 +107,9 @@ class SlamBackend:
         #   pose indexed by t.
         self.landmark_visibility = dict()
 
+        # Taking stuff from frontend
+        self.vis = frontend.vis
+        self.l_xy = frontend.l_xy
         #TODO: load from config file?
         self.sigma_odometry = frontend.sigma_odometry
         self.sigma_range = frontend.sigma_range
@@ -130,6 +133,49 @@ class SlamBackend:
         :return:
         """
         self.odometry_measurements[t] = odometry_measurement
+
+    def draw_estimated_landmarks(self):
+        nl = len(self.l_xy_e_dict)
+        l_xy_e = np.zeros((nl, 3))
+        for i, (k, l_xy_e_i) in enumerate(self.l_xy_e_dict.items()):
+            l_xy_e[i][:2] = l_xy_e_i
+            points = np.zeros((2, 3))
+            points[0, :2] = l_xy_e_i
+            points[1, :2] = self.l_xy[k]
+            self.vis["landmarks_e"]["corrspondances"][str(k)].set_object(
+                meshcat.geometry.Line(
+                    meshcat.geometry.PointsGeometry(points.T)))
+
+        point_colors = np.zeros_like(l_xy_e)
+        point_colors[:, 1] = 1
+        point_colors[:, 2] = 1
+        self.vis["landmarks_e"]["points"].set_object(
+            meshcat.geometry.PointCloud(
+                position=l_xy_e.T, color=point_colors.T, size=0.1))
+
+    def draw_robots(self, t_xy, color, prefix: str):
+        for i in range(1, len(t_xy)):
+            points = np.zeros((2, 3))
+            points[0, :2] = t_xy[i - 1]
+            points[1, :2] = t_xy[i]
+            self.vis[prefix]["path"][str(i)].set_object(
+                meshcat.geometry.Line(
+                    meshcat.geometry.PointsGeometry(points.T)))
+
+        t_xy3 = np.vstack((t_xy.T, np.zeros(len(t_xy)))).T
+        point_colors = np.zeros_like(t_xy3)
+        point_colors[:] = color
+        self.vis[prefix]["points"].set_object(
+            meshcat.geometry.PointCloud(
+                position=t_xy3.T, color=point_colors.T, size=0.2))
+
+    def draw_estimated_robots(self):
+        nt = len(self.t_xy_e_dict)
+        t_xy_e = np.zeros((nt, 2))
+        for i in range(nt):
+            t_xy_e[i] = self.t_xy_e_dict[i]
+
+        self.draw_robots(t_xy_e, color=[1, 0, 0], prefix="robot_poses_e")
 
     def run_bundle_adjustment(self):
         t = len(self.odometry_measurements)
@@ -236,3 +282,8 @@ if __name__ == "__main__":
         print("ture robot position: ", t_xy[t])
         print("true landmark positions\n",
               frontend.l_xy[list(backend.landmark_visibility.keys())])
+
+
+#%%
+    backend.draw_estimated_robots()
+    backend.draw_robots(t_xy, color=[0, 1, 0], prefix="robot_gt")
