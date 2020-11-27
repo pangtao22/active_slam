@@ -7,6 +7,17 @@ def calc_angle_diff(angle1, angle2):
     return (np.pi + angle2 - angle1) % (np.pi * 2) - np.pi
 
 
+def calc_angle_sum(angle1, angle2):
+    assert -np.pi <= angle1 <= np.pi
+    assert -np.pi <= angle2 <= np.pi
+    sum12 = angle1 + angle2
+
+    if sum12 > np.pi * 2:
+        return sum12 - 2 * np.pi
+    if sum12 < -np.pi * 2:
+        return sum12 + 2 * np.pi
+    return  sum12
+
 class SlamFrontend:
     def __init__(self, num_landmarks: int, seed: int):
         random.seed(seed)
