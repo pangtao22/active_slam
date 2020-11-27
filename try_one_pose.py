@@ -9,8 +9,7 @@ from slam_backend import SlamBackend
 # X_WBs[0, :2] = np.array([1.5, -1.3])
 # X_WBs[1, :2] = X_WBs[0, :2] + [0, 1.]
 
-X_WBs = np.zeros((10, 3))
-X_WBs[0, :2] = np.array([1.5, -1.3])
+X_WBs = np.zeros((10, 2))
 X_WBs[1, :2] = X_WBs[0, :2] + [0, 1.]
 X_WBs[2, :2] = X_WBs[1, :2] + [-0.1, 0]
 X_WBs[3, :2] = X_WBs[2, :2] + [-0.3, 0]
@@ -21,7 +20,6 @@ X_WBs[7, :2] = X_WBs[6, :2] + [0, 0.5]
 X_WBs[8, :2] = X_WBs[7, :2] + [1.5, 2.5]
 X_WBs[9, :2] = X_WBs[8, :2] + [1.5, -2]
 
-X_WBs[:, 2] = np.random.rand(len(X_WBs)) * 2 * np.pi - np.pi
 
 frontend = SlamFrontend(num_landmarks=50, seed=16485)
 backend = SlamBackend(X_WBs[0], frontend)
@@ -34,7 +32,7 @@ backend.draw_robot_path(X_WBs, color=[0, 1, 0], prefix="robot_gt")
 #%%
 X_WB_e0 = backend.get_X_WB_initial_guess_array()
 l_xy_e0 = backend.get_l_xy_initial_guess_array()
-J, b = backend.calc_jacobian_and_b(X_WB_e0, l_xy_e0)
+J, b, sigmas = backend.calc_jacobian_and_b(X_WB_e0, l_xy_e0)
 
 
 #%%
@@ -49,10 +47,10 @@ for t in range(len(X_WBs)):
             X_WB=X_WBs[t], X_WB_previous=X_WBs[t - 1])
         backend.update_odometry_measruements(t, odometry_measurement)
 
-    try:
-        X_WB_e, l_xy_e = backend.run_bundle_adjustment()
-    except AssertionError:
-        break
+    # try:
+    X_WB_e, l_xy_e = backend.run_bundle_adjustment()
+    # except AssertionError:
+    #     break
 
     frontend.draw_robot(backend.X_WB_e_dict[t])
     backend.draw_estimated_path()
@@ -69,15 +67,13 @@ def calc_odometry_error(X_WB_list, X_I_I1_list):
     assert len(X_I_I1_list) == n - 1
 
     error_position = 0.
-    error_angle = 0.
     for i in range(n - 1):
         dxy = (X_WB_list[i+1][:2] - X_WB_list[i][:2]) - X_I_I1_list[i][:2]
         error_position += (dxy ** 2).sum()
 
         a = calc_angle_diff(X_WB_list[i][2], X_WB_list[i+1][2])
-        error_angle += calc_angle_diff(a, X_I_I1_list[i][2])**2
 
-    return error_position, error_angle
+    return error_position
 
 
 

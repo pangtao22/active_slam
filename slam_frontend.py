@@ -16,7 +16,8 @@ def calc_angle_sum(angle1, angle2):
         return sum12 - 2 * np.pi
     if sum12 < -np.pi * 2:
         return sum12 + 2 * np.pi
-    return  sum12
+    return sum12
+
 
 class SlamFrontend:
     def __init__(self, num_landmarks: int, seed: int):
@@ -31,11 +32,12 @@ class SlamFrontend:
         self.y_max = bbox_length / 2
         self.box_length = bbox_length
 
-        self.r_range_max = bbox_length / 5
-        self.r_range_min = max(self.r_range_max/10, 0.1)
+        self.r_range_max = 1
+        self.r_range_min = 0.2
 
         # coordinates of landmarks.
-        self.l_xy = random.rand(self.nl, 2) * bbox_length - bbox_length / 2
+        self.l_xy = random.rand(self.nl, 2) * bbox_length - bbox_length / 2 +\
+                    np.array([-1.5, 1.3])
 
         # visualizer
         self.vis = meshcat.Visualizer(zmq_url="tcp://127.0.0.1:6000")
@@ -53,9 +55,11 @@ class SlamFrontend:
         self.vis["robot"].set_transform(self.X_WB)
 
         # noise
-        self.sigma_odometry = 0.05
+        self.sigma_odometry = 0.1
         self.sigma_range = 0.05
-        self.kappa_bearing = 1 / 0.05**2  # von-mises distribution.
+        self.sigma_bearing = 0.05
+        # von-mises distribution.
+        self.kappa_bearing = 1 / self.sigma_bearing **2
 
     def draw_landmarks(self):
         l_xyz = np.zeros((self.nl, 3))
@@ -86,26 +90,23 @@ class SlamFrontend:
         :param X_WB_previous: Previous robot configuration.
         :return:
         """
-        X_WB_m = np.zeros(3)
+        X_WB_m = np.zeros(2)
 
         X_WB_m[:2] = X_WB[:2] - X_WB_previous[:2] + random.normal(
             scale=self.sigma_odometry, size=2)
-        X_WB_m[2] = random.vonmises(calc_angle_diff(X_WB_previous[2], X_WB[2]),
-                                    self.kappa_bearing)
 
         return X_WB_m
 
-    def get_landmark_measurements(self, X_WB_xy_theta):
+    def get_landmark_measurements(self, X_WB_xy):
         """
-        :param X_WB_xy_theta: robot pose ([x, y, theta]]) in world frame.
+        :param X_WB_xy: robot pose ([x, y]]) in world frame.
         :return:
         (1) idx_visible_l: indices into self.l_xy whose distance to t_xy is
             smaller than self.r_sensor.
         (2) noisy measurements of distances to self.l_xy[idx_visible_l]
         """
-        X_WB = meshcat.transformations.rotation_matrix(
-            X_WB_xy_theta[2], np.array([0, 0, 1.]))
-        X_WB[:2, 3] = X_WB_xy_theta[:2]
+        X_WB = meshcat.transformations.rotation_matrix(0, np.array([0, 0, 1.]))
+        X_WB[:2, 3] = X_WB_xy
         l_xyz_W = np.zeros((self.nl, 3))
         l_xyz_W[:, :2] = self.l_xy
 
@@ -114,15 +115,12 @@ class SlamFrontend:
         d_l = np.linalg.norm(l_xyz_B, axis=1)
         theta_l_B = np.arctan2(l_xyz_B[:, 1], l_xyz_B[:, 0])
 
-        angle_in_range = np.any(
-            [theta_l_B < -np.pi * 0.75, theta_l_B > -np.pi * 0.25], axis=0)
         is_visible = np.all(
-            [d_l > self.r_range_min, d_l < self.r_range_max, angle_in_range],
-            axis=0)
+            [d_l > self.r_range_min, d_l < self.r_range_max], axis=0)
         idx_visible_l = np.where(is_visible)[0]
         d_l_noisy = d_l[idx_visible_l] + random.normal(
             scale=self.sigma_range, size=idx_visible_l.size)
-        bearings_noisy = random.vonmises(theta_l_B[idx_visible_l],
-                                        self.kappa_bearing)
+        bearings_noisy = random.vonmises(
+            theta_l_B[idx_visible_l], self.kappa_bearing)
 
         return idx_visible_l, d_l_noisy, bearings_noisy
