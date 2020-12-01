@@ -14,16 +14,34 @@ from slam_frontend import SlamFrontend, calc_angle_diff
 class SlamBackend:
     def __init__(self, X_WB_e_0, frontend: SlamFrontend):
         """
+        Indices (consistent with Indelman2015, aka "the paper".)
+            Constants:
+            k: current time step.
+            L: planning horizon.
 
-        :param X_WB_e_0: initial estimated robot position,
-            used to anchor the entire trajectory.
+            i: time step.
+            j: landmark.
+            l \in [k, k+L]: one of the future time steps up to L.
+
+
+        :param X_WB_e_0: np array of shape (self.dim_X). Initial estimated
+            robot position, used to anchor the entire trajectory.
         """
         self.solver = GurobiSolver()
         self.X_WB_e_0 = X_WB_e_0.copy()
 
+        self.dim_l = 2  # dimension of landmarks.
+        self.dim_X = 2  # dimension of poses.
+
         # current beliefs
         self.X_WB_e_dict = {0: self.X_WB_e_0}
         self.l_xy_e_dict = dict()
+
+        # Information matrix of current robot poses and landmarks, which are
+        # ordered as follows:
+        # [X_WB_e0, ... X_WB_e_k, l_xy_e0, ... l_xy_eK]
+        # The landmarks are ordered as self.l_xy_e_dict.keys().
+        self.I_all = None
 
         # past measurements
         self.odometry_measurements = dict()
@@ -43,8 +61,10 @@ class SlamBackend:
         self.sigma_range = frontend.sigma_range
         self.sigma_bearing = frontend.sigma_bearing
 
-        self.dim_l = 2  # dimension of landmarks.
-        self.dim_X = 2  # dimension of poses.
+        self.sigma_dynamics = self.sigma_odometry
+
+        self.r_range_max = frontend.r_range_max
+        self.r_range_min = frontend.r_range_min
 
     def update_landmark_measurements(
             self, t, idx_visible_l_list, d_l_measured_list, b_l_measured_list):
@@ -141,11 +161,53 @@ class SlamBackend:
 
         return A - B.dot(np.linalg.inv(C)).dot(B.T)
 
+    def calc_range_derivatives(self, J, i_row, j_start_x, j_start_l, d_xy,
+                               sigma=1.0):
+        """
+
+        :param i_row:
+        :param j_start_x:
+        :param j_start_l:
+        :param d_xy: X_WB - l_xy
+        :return:
+        """
+        d = np.sqrt((d_xy ** 2).sum())
+        d_xy /= d
+        J[i_row, j_start_x: j_start_x + 2] += d_xy / sigma
+        J[i_row, j_start_l: j_start_l + self.dim_l] += -d_xy / sigma
+
+        return d
+
+    def calc_bearing_derivatives(self, J, i_row, j_start_x, j_start_l,
+                                 X_WB, l_xy, sigma=1.0):
+        xb = X_WB[0]
+        yb = X_WB[1]
+        xl = l_xy[0]
+        yl = l_xy[1]
+        dx = xl - xb
+        dy = yl - yb
+        d_arctan_D_dx = 1 / (1 + (dy / dx) ** 2) * (-dy / dx ** 2)
+        d_arctan_D_dy = 1 / (1 + (dy / dx) ** 2) * (1 / dx)
+        d_arctan_D_dxy = np.array([d_arctan_D_dx, d_arctan_D_dy])
+
+        J[i_row, j_start_x: j_start_x + 2] += -d_arctan_D_dxy / sigma
+        J[i_row, j_start_l: j_start_l + self.dim_l] += d_arctan_D_dxy / sigma
+
+        return dx, dy
+
+    @staticmethod
+    def calc_num_landmark_measurements(landmark_measurements):
+        nl_measurements = 0  # number of landmark measurements
+        for visible_landmarks_i in landmark_measurements.values():
+            nl_measurements += len(visible_landmarks_i)
+        return nl_measurements
+
     def calc_jacobian_and_b(self, X_WB_e, l_xy_e):
         """
         :param X_WB_e (n_o + 1, 3)
         :param l_xy_e (nl, 2): coordinates of landmarks, ordered the same way as
             self.landmark_measurements.
+        :param landmark_measurements:
         :return:
         """
         dim_l = self.dim_l  # dimension of landmarks.
@@ -153,12 +215,13 @@ class SlamBackend:
 
         nl = len(self.landmark_measurements)  # number of landmarks
         n_o = len(self.odometry_measurements)  # number of odometries
-        nl_measurements = 0  # number of landmark measurements
-        for visible_landmarks_i in self.landmark_measurements.values():
-            nl_measurements += len(visible_landmarks_i)
+
+        # number of landmark measurements
+        nl_measurements = self.calc_num_landmark_measurements(
+            self.landmark_measurements)
 
         n_rows = n_o * dim_X + nl_measurements * dim_l + self.dim_X
-        n_cols = (n_o + 1) * dim_X + nl * dim_l
+        n_cols = (n_o + 1) * dim_X + nl * 2
         J = np.zeros((n_rows, n_cols))
         b = np.zeros(n_rows)
         sigmas = np.zeros(n_rows)
@@ -183,7 +246,7 @@ class SlamBackend:
 
         # range and bearing measurements.
         i_row = n_o * dim_X
-        for i_k, (k, visible_robot_poses) in enumerate(
+        for idx_j, (j, visible_robot_poses) in enumerate(
                 self.landmark_measurements.items()):
             for i in visible_robot_poses.keys():
                 # i: index of robot poses visible from
@@ -191,35 +254,21 @@ class SlamBackend:
                 b_ik_m = visible_robot_poses[i]["bearing"]
 
                 # range.
-                d_xy = X_WB_e[i, :2] - l_xy_e[i_k]
-                d = np.sqrt((d_xy**2).sum())
-                d_xy /= d
+                d_xy = X_WB_e[i, :2] - l_xy_e[idx_j]
 
-                j_start = i * dim_X
-                J[i_row, j_start: j_start + 2] += d_xy
-
-                j0 = (n_o + 1) * dim_X + i_k * dim_l
-                j1 = j0 + dim_l
-                J[i_row, j0: j1] += -d_xy
+                j_start_x = i * dim_X
+                j_start_l = (n_o + 1) * dim_X + idx_j * dim_l
+                d = self.calc_range_derivatives(
+                    J, i_row, j_start_x, j_start_l, d_xy)
 
                 b[i_row] = d - d_ik_m
                 sigmas[i_row] = self.sigma_range
 
                 # bearing.
                 i_row += 1
-                xb = X_WB_e[i, 0]
-                yb = X_WB_e[i, 1]
-                xl = l_xy_e[i_k][0]
-                yl = l_xy_e[i_k][1]
-                dx = xl - xb
-                dy = yl - yb
-                d_arctan_D_dx = 1 / (1 + (dy/dx)**2) * (-dy/dx**2)
-                d_arctan_D_dy = 1 / (1 + (dy/dx)**2) * (1/dx)
-                d_arctan_D_dxy = np.array([d_arctan_D_dx, d_arctan_D_dy])
-
-                J[i_row, j_start: j_start + 2] += -d_arctan_D_dxy
-                J[i_row, j_start + 2] += -1
-                J[i_row, j0: j1] += d_arctan_D_dxy
+                dx, dy = self.calc_bearing_derivatives(
+                    J, i_row, j_start_x, j_start_l,
+                    X_WB_e[i], l_xy_e[idx_j])
 
                 b[i_row] = calc_angle_diff(b_ik_m, np.arctan2(dy, dx))
                 sigmas[i_row] = self.sigma_bearing
@@ -227,6 +276,91 @@ class SlamBackend:
                 i_row += 1
 
         return J, b, sigmas
+
+    def calc_inner_layer(self, dX_WB, l_xy_e):
+        """
+        Algorithm 4 in the paper.
+        :param dX_WB: [l, self.dim_X]. Input for time steps [l : ].
+        :return:
+        """
+        # X_WB_e: belief. e stands for "estimated".
+        # X_WB_p: prediction. corresponds to quantities with an overbar.
+        n_p = len(self.X_WB_e_dict)
+        k = n_p - 1  # current time step.
+        l = len(dX_WB)
+
+        # future predictions.
+        X_WB_p = self.calc_pose_predictions(dX_WB)
+
+        # Find the visible landmarks for every X_WB_p[i].
+        # Store in {i: [landmark order indices.]}, i.e. the same order as
+        #   self.landmark_measurements.
+        future_landmark_measurements = self.find_visible_landmarks(X_WB_p)
+        nl = len(self.landmark_measurements)  # number of landmarks
+        # number of new landmark measurements
+        nl_measurements = self.calc_num_landmark_measurements(
+            future_landmark_measurements)
+
+        # Structure of new "state"
+        # [X_WB_0, ... X_WB_{k},
+        #  l_xy (all landmarks),
+        #  X_WB_{k+1}, ... X_WB_{k+l}]
+        n_Xk = n_p * self.dim_X + nl * self.dim_l
+        n_rows = l * self.dim_X + 2 * nl_measurements
+        n_cols = l * self.dim_X + n_Xk
+
+        # A is the lower half of \mathcal{A} in Eq. (32), i.e. [F; H].
+        A = np.zeros((n_rows, n_cols))
+
+        # dynamics
+        for i in range(l):
+            i0 = (k + i) * self.dim_X
+            i1 = i0 + self.dim_X
+
+            A[i0: i1, n_Xk + i0: n_Xk + i1] = \
+                np.eye(self.dim_X) / self.sigma_dynamics
+
+            if i == 0:
+                A[i0: i1, (n_p - 1) * self.dim_X: n_p * self.dim_X] = \
+                    -np.eye(self.dim_X) / self.sigma_dynamics
+            else:
+                A[i0: i1, n_Xk + i0 - self.dim_X: n_Xk + i1 - self.dim_X] = \
+                    -np.eye(self.dim_X) / self.sigma_dynamics
+
+        # observations
+        i_row = l * self.dim_X
+        for idx_j, (j, visible_robot_poses) in enumerate(
+                future_landmark_measurements.items()):
+            for i in visible_robot_poses.keys():
+                d_xy = X_WB_p[i] - l_xy_e[idx_j]
+                j_start_x = n_Xk + i * self.dim_X
+                j_start_l = n_p * self.dim_X + idx_j * self.dim_l
+
+                self.calc_range_derivatives(
+                    A, i_row, j_start_x, j_start_l, d_xy,
+                    sigma=self.sigma_range)
+
+                self.calc_bearing_derivatives(
+                    A, i_row + 1, j_start_x, j_start_l,
+                    X_WB_p[i], l_xy_e[idx_j], sigma=self.sigma_bearing)
+
+                i_row += 2
+
+        return A
+
+    def calc_pose_predictions(self, dX_WB):
+        l = len(dX_WB)
+        X_WB_p = np.zeros((l, self.dim_X))  # k + 1 : (k + l)
+        k = len(self.X_WB_e_dict) - 1   # current time step.
+        X_WB_e_k = self.X_WB_e_dict[k]
+
+        for i in range(l):
+            if i == 0:
+                X_WB_p[i] = X_WB_e_k + dX_WB[i]
+            else:
+                X_WB_p[i] = X_WB_p[i - 1]
+
+        return X_WB_p
 
     def run_bundle_adjustment(self):
         dim_l = self.dim_l  # dimension of landmarks.
@@ -280,7 +414,7 @@ class SlamBackend:
                     np.linalg.norm(dx_values) / (n_p + n_l) < 5e-3:
                 break
 
-        self.update_beliefs(X_WB_e, l_xy_e)
+        self.update_beliefs(X_WB_e, l_xy_e, Omega)
 
         print("\nStep ", n_o)
         print("optimal cost: ", optimal_cost)
@@ -291,13 +425,15 @@ class SlamBackend:
         print("gradient norm: ", np.linalg.norm(J.T.dot(b)))
         print("dx norm: ", np.linalg.norm(dx_values))
         Omega_pose = self.marginalize_info_matrix(Omega, n_p, n_l)
-        print("Covariance diagonal\n",
+        print("Marginalized covariance diagonal\n",
               np.linalg.inv(Omega_pose).diagonal())
+        print("Covariance diagonal\n",
+              np.linalg.inv(Omega).diagonal()[:self.dim_X * n_p])
         print("\n")
 
         return X_WB_e, l_xy_e
 
-    def update_beliefs(self, X_WB_e_values, l_xy_e_values):
+    def update_beliefs(self, X_WB_e_values, l_xy_e_values, I_all):
         for i, X_WB_e in enumerate(X_WB_e_values):
             self.X_WB_e_dict[i] = X_WB_e
 
@@ -305,6 +441,23 @@ class SlamBackend:
         for k, l_xy_e_value in zip(self.landmark_measurements.keys(),
                                    l_xy_e_values):
             self.l_xy_e_dict[k] = l_xy_e_value
+
+        self.I_all = I_all
+
+    def find_visible_landmarks(self, X_WB_p):
+        future_landmark_measurements = dict()
+        for i, X_WB in enumerate(X_WB_p):
+            for j in self.l_xy_e_dict.keys():
+                d_xy = self.l_xy_e_dict[j] - X_WB
+                d = np.linalg.norm(d_xy)
+                if self.r_range_min < d < self.r_range_max:
+                    if j not in future_landmark_measurements:
+                        future_landmark_measurements[j] = dict()
+                    b = np.arctan2(d_xy[1], d_xy[0])
+                    future_landmark_measurements[j][i] = {
+                        "distance": d, "bearing": b}
+
+        return future_landmark_measurements
 
     def draw_estimated_path(self):
         nt = len(self.X_WB_e_dict)

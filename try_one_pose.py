@@ -36,7 +36,7 @@ J, b, sigmas = backend.calc_jacobian_and_b(X_WB_e0, l_xy_e0)
 
 
 #%%
-for t in range(len(X_WBs)):
+for t in range(1):
     idx_visible_l_list, d_l_measured_list, bearings_measured_list = \
         frontend.get_landmark_measurements(X_WBs[t])
     backend.update_landmark_measurements(
@@ -58,7 +58,7 @@ for t in range(len(X_WBs)):
     print("robot pose estimated: ", X_WB_e[-1])
     print("robot_pose true: ", X_WBs[t])
 
-    input("next?")
+    # input("next?")
 
 
 #%%
@@ -75,6 +75,18 @@ def calc_odometry_error(X_WB_list, X_I_I1_list):
 
     return error_position
 
+
+#%%
+dX_WB = np.zeros((2, 2))
+X_WB_p = backend.calc_pose_predictions(dX_WB)
+
+
+#%%
+flm = backend.find_visible_landmarks(X_WB_p)
+l_xy_e_list = backend.get_l_xy_belief()
+
+A = backend.calc_inner_layer(dX_WB, l_xy_e_list)
+print(flm)
 
 
 #%%
