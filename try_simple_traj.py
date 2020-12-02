@@ -1,39 +1,37 @@
 import numpy as np
 import numpy.random as random
 
+from pydrake.math import inv
+
 from slam_frontend import SlamFrontend, calc_angle_diff
 from slam_backend import SlamBackend
 
 #%%
-# X_WBs = np.zeros((2, 3))
-# X_WBs[0, :2] = np.array([1.5, -1.3])
+X_WBs = np.zeros((2, 2))
+X_WBs[1, :2] = X_WBs[0, :2] + [0, 1.7]
+
+# X_WBs = np.zeros((10, 2))
 # X_WBs[1, :2] = X_WBs[0, :2] + [0, 1.]
-
-X_WBs = np.zeros((10, 2))
-X_WBs[1, :2] = X_WBs[0, :2] + [0, 1.]
-X_WBs[2, :2] = X_WBs[1, :2] + [-0.1, 0]
-X_WBs[3, :2] = X_WBs[2, :2] + [-0.3, 0]
-X_WBs[4, :2] = X_WBs[3, :2] + [-0.5, 0.5]
-X_WBs[5, :2] = X_WBs[4, :2] + [-1, -0.2]
-X_WBs[6, :2] = X_WBs[5, :2] + [-1, -1]
-X_WBs[7, :2] = X_WBs[6, :2] + [0, 0.5]
-X_WBs[8, :2] = X_WBs[7, :2] + [1.5, 2.5]
-X_WBs[9, :2] = X_WBs[8, :2] + [1.5, -2]
+# X_WBs[2, :2] = X_WBs[1, :2] + [-0.1, 0]
+# X_WBs[3, :2] = X_WBs[2, :2] + [-0.3, 0]
+# X_WBs[4, :2] = X_WBs[3, :2] + [-0.5, 0.5]
+# X_WBs[5, :2] = X_WBs[4, :2] + [-1, -0.2]
+# X_WBs[6, :2] = X_WBs[5, :2] + [-1, -1]
+# X_WBs[7, :2] = X_WBs[6, :2] + [0, 0.5]
+# X_WBs[8, :2] = X_WBs[7, :2] + [1.5, 2.5]
+# X_WBs[9, :2] = X_WBs[8, :2] + [1.5, -2]
 
 
-frontend = SlamFrontend(num_landmarks=50, seed=16485)
+frontend = SlamFrontend(num_landmarks=3, seed=16485)
 backend = SlamBackend(X_WBs[0], frontend)
 
 frontend.draw_robot(X_WBs[0])
 print(frontend.get_landmark_measurements(X_WBs[0]))
 backend.draw_robot_path(X_WBs, color=[0, 1, 0], prefix="robot_gt")
 
-
 #%%
 X_WB_e0 = backend.get_X_WB_initial_guess_array()
 l_xy_e0 = backend.get_l_xy_initial_guess_array()
-J, b, sigmas = backend.calc_jacobian_and_b(X_WB_e0, l_xy_e0)
-
 
 #%%
 for t in range(1):
@@ -62,6 +60,27 @@ for t in range(1):
 
 
 #%%
+dX_WB = np.zeros((10, 2))
+dX_WB[:, 0] = 0.05
+dX_WB[:, 1] = 0.05
+
+# dX_WB = np.random.rand(10, 2)
+X_WB_p = backend.calc_pose_predictions(dX_WB)
+
+#%%
+X_WB_e_list = backend.get_X_WB_belief()
+l_xy_e_list = backend.get_l_xy_belief()
+
+Omega, q, c = backend.calc_info_matrix(X_WB_e_list, l_xy_e_list)
+A2 = backend.calc_A_lower_half(dX_WB, l_xy_e_list)
+I_e, I_p, X_WB_p = backend.calc_inner_layer(dX_WB, l_xy_e_list, Omega)
+Cov_e = inv(I_e)
+Cov_p = inv(I_p)
+print("Cov_e", Cov_e.diagonal())
+print("Cov_p", Cov_p.diagonal())
+
+
+#%%
 def calc_odometry_error(X_WB_list, X_I_I1_list):
     n = len(X_WB_list)
     assert len(X_I_I1_list) == n - 1
@@ -74,19 +93,6 @@ def calc_odometry_error(X_WB_list, X_I_I1_list):
         a = calc_angle_diff(X_WB_list[i][2], X_WB_list[i+1][2])
 
     return error_position
-
-
-#%%
-dX_WB = np.zeros((2, 2))
-X_WB_p = backend.calc_pose_predictions(dX_WB)
-
-
-#%%
-flm = backend.find_visible_landmarks(X_WB_p)
-l_xy_e_list = backend.get_l_xy_belief()
-
-A = backend.calc_inner_layer(dX_WB, l_xy_e_list)
-print(flm)
 
 
 #%%

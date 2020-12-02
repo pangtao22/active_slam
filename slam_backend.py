@@ -359,7 +359,7 @@ class SlamBackend:
 
     def calc_inner_layer(self, dX_WB, l_xy_e, I_Xk):
         """
-
+        Algorithm 4 in the paper.
         :param dX_WB:
         :param X_WB_e:
         :param l_xy_e:
@@ -408,6 +408,13 @@ class SlamBackend:
                 X_WB_p[i] = X_WB_p[i - 1] + dX_WB[i]
 
         return X_WB_p
+
+    def eval_objective(self):
+        """
+        Algorithm 3 in the paper.
+        :return:
+        """
+        pass
 
     def run_bundle_adjustment(self):
         dim_l = self.dim_l  # dimension of landmarks.

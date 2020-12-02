@@ -36,8 +36,9 @@ class SlamFrontend:
         self.r_range_min = 0.2
 
         # coordinates of landmarks.
-        self.l_xy = random.rand(self.nl, 2) * bbox_length - bbox_length / 2 +\
-                    np.array([-1.5, 1.3])
+        # self.l_xy = random.rand(self.nl, 2) * bbox_length - bbox_length / 2 +\
+        #             np.array([-1.5, 1.3])
+        self.l_xy = np.array([[0, 0.5], [-0.6, 0.1], [-0.7, -0.2]])
 
         # visualizer
         self.vis = meshcat.Visualizer(zmq_url="tcp://127.0.0.1:6000")
