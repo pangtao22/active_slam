@@ -2,6 +2,8 @@ import numpy as np
 import numpy.random as random
 
 from pydrake.math import inv
+from pydrake.autodiffutils import (initializeAutoDiff, autoDiffToValueMatrix,
+    autoDiffToGradientMatrix)
 
 from slam_frontend import SlamFrontend, calc_angle_diff
 from slam_backend import SlamBackend
@@ -72,12 +74,35 @@ X_WB_e_list = backend.get_X_WB_belief()
 l_xy_e_list = backend.get_l_xy_belief()
 
 Omega, q, c = backend.calc_info_matrix(X_WB_e_list, l_xy_e_list)
-A2 = backend.calc_A_lower_half(dX_WB, l_xy_e_list)
-I_e, I_p, X_WB_p = backend.calc_inner_layer(dX_WB, l_xy_e_list, Omega)
+A2, X_WB_p = backend.calc_A_lower_half(dX_WB, l_xy_e_list)
+I_e, I_p, X_WB_p, A2 = backend.calc_inner_layer(dX_WB, l_xy_e_list, Omega)
 Cov_e = inv(I_e)
 Cov_p = inv(I_p)
 print("Cov_e", Cov_e.diagonal())
 print("Cov_p", Cov_p.diagonal())
+
+
+#%%
+c_a, c_b, c_c1, c_c2 = backend.calc_objective(
+    dX_WB, X_WB_e_list, l_xy_e_list, X_WB_p[-1])
+
+
+#%% Autodiff
+dX_WB_ad = initializeAutoDiff(dX_WB.ravel())
+dX_WB_ad.resize(dX_WB.shape)
+a = 0
+for i in range((len(dX_WB_ad))):
+    a += dX_WB_ad[i].sum() * i
+a.derivatives().reshape(dX_WB.shape)
+
+#%%
+A2_ad = backend.calc_A_lower_half(dX_WB_ad, l_xy_e_list)
+I_e_ad, I_p, X_WB_p_ad, _ = backend.calc_inner_layer(
+    dX_WB_ad, l_xy_e_list, Omega)
+Cov_e_ad = inv(I_e_ad)
+Cov_p_ad = inv(I_p)
+print("Cov_e_ad", autoDiffToValueMatrix(Cov_e_ad).diagonal())
+print("Cov_p_ad", autoDiffToValueMatrix(Cov_p_ad).diagonal())
 
 
 #%%

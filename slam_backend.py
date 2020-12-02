@@ -7,7 +7,7 @@ from pydrake.solvers.ipopt import IpoptSolver
 from pydrake.solvers.snopt import SnoptSolver
 from pydrake.solvers.gurobi import GurobiSolver
 import pydrake.solvers.mathematicalprogram as mp
-from pydrake.symbolic import sqrt
+from pydrake.math import inv
 
 from slam_frontend import SlamFrontend, calc_angle_diff
 
@@ -66,6 +66,9 @@ class SlamBackend:
 
         self.r_range_max = frontend.r_range_max
         self.r_range_min = frontend.r_range_min
+
+        # weights/selection matrices for the cost function.
+        self.M_u = np.ones(self.dim_l) * 0.1
 
     def update_landmark_measurements(
             self, t, idx_visible_l_list, d_l_measured_list, b_l_measured_list):
@@ -319,7 +322,7 @@ class SlamBackend:
         n_cols = l * self.dim_X + n_Xk
 
         # A2 is the lower half of \mathcal{A} in Eq. (32), i.e. [F; H].
-        A2 = np.zeros((n_rows, n_cols))
+        A2 = np.zeros((n_rows, n_cols), dtype=dX_WB.dtype)
 
         # dynamics
         for i in range(l):
@@ -369,7 +372,7 @@ class SlamBackend:
         n_Xk = I_Xk.shape[0]  # size of states up to now.
         l = len(dX_WB)
 
-        def calc_I(A2):
+        def calc_I(A2, dtype):
             n_Xl = A2.shape[1] - n_Xk  # size of states into the future.
             n_X = n_Xk + n_Xl
 
@@ -377,7 +380,7 @@ class SlamBackend:
             A22 = A2[:, n_Xk:]
 
             # I_X{k+l} = A.T.dot(A)
-            I = np.zeros((n_X, n_X), dtype=dX_WB.dtype)
+            I = np.zeros((n_X, n_X), dtype=dtype)
             I[:n_Xk, :n_Xk] = I_Xk + A21.T.dot(A21)
             I[:n_Xk, n_Xk:] = A21.T.dot(A22)
             I[n_Xk:, :n_Xk] = I[:n_Xk, n_Xk:].T
@@ -386,22 +389,25 @@ class SlamBackend:
             return I
 
         # lower half of A
-        A2_full, X_WB_p = self.calc_A_lower_half(dX_WB, l_xy_e)
-        I_e = calc_I(A2_full)  # including landmarks.
-        I_p = calc_I(A2_full[:l*self.dim_X])
+        A2, X_WB_p = self.calc_A_lower_half(dX_WB, l_xy_e)
+        # including landmarks.
+        I_e = calc_I(A2, dtype=object)
+        # excluding landmarks.
+        I_p = calc_I(A2[: l * self.dim_X], dtype=np.float)
 
-        return I_e, I_p, X_WB_p
+        return I_e, I_p, X_WB_p, A2
         # A1 = np.hstack([sqrtm(I_Xk), np.zeros((n_Xk, n_Xl))])
         # A = np.vstack([A1, A2])
         # return A.T.dot(A)
 
     def calc_pose_predictions(self, dX_WB):
-        l = len(dX_WB)
-        X_WB_p = np.zeros((l, self.dim_X))  # k + 1 : (k + l)
+        L = len(dX_WB)
+        # robot configuration for time steps k + 1 : (k + L).
+        X_WB_p = np.zeros((L, self.dim_X), dtype=dX_WB.dtype)
         k = len(self.X_WB_e_dict) - 1   # current time step.
         X_WB_e_k = self.X_WB_e_dict[k]
 
-        for i in range(l):
+        for i in range(L):
             if i == 0:
                 X_WB_p[i] = X_WB_e_k + dX_WB[i]
             else:
@@ -409,12 +415,56 @@ class SlamBackend:
 
         return X_WB_p
 
-    def eval_objective(self):
+    def calc_objective(self, dX_WB, X_WB_e, l_xy_e, X_WB_g):
         """
         Algorithm 3 in the paper.
         :return:
         """
-        pass
+        L = len(dX_WB)
+        Omega, _, _ = self.calc_info_matrix(X_WB_e, l_xy_e)
+
+        # (a) in eq. (41).
+        c_a = (dX_WB * self.M_u * dX_WB).sum()
+
+        # (b) in eq. (41).
+        c_b = 0.
+        for l in range(L):
+            I_e_l, I_p_l, X_WB_p_l, A2_l = self.calc_inner_layer(
+                dX_WB[:l + 1], l_xy_e, Omega)
+            Cov_e_l = inv(I_e_l)
+            c_b += Cov_e_l[-self.dim_X:, -self.dim_X:].diagonal().sum()
+
+        Cov_e_L = Cov_e_l
+        Cov_p_L = inv(I_p_l)
+        X_WB_p_L = X_WB_p_l
+        A2_L = A2_l
+
+        # (c) in eq. (41)
+        c_c1 = ((X_WB_p_L[-1] - X_WB_g)**2).sum()
+
+        H_kL = A2_L[L * self.dim_X:]
+        J_kL = H_kL.copy()
+        J_kL[0::2] *= self.sigma_range
+        J_kL[1::2] *= self.sigma_bearing
+
+        # B.shape = (self.dim_X, m2),
+        #   where m2 is the number of range and bearing measurements of
+        #   the trajectory X_WB_p_L.
+        B = Cov_e_L[-self.dim_X:].dot(H_kL.T)
+        B[:, 0::2] /= self.sigma_range
+        B[:, 1::2] /= self.sigma_bearing
+        Q_kL = B.T.dot(B)
+
+        Omega_v = np.zeros(B.shape[1])
+        Omega_v[0::2] = self.sigma_range**2
+        Omega_v[1::2] = self.sigma_bearing**2
+
+        D = J_kL.dot(Cov_p_L).dot(J_kL.T)
+        D[np.diag_indices_from(D)] += Omega_v
+
+        c_c2 = Q_kL.dot(D).diagonal().sum()
+
+        return c_a, c_b, c_c1, c_c2
 
     def run_bundle_adjustment(self):
         dim_l = self.dim_l  # dimension of landmarks.
