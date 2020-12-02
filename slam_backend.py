@@ -1,6 +1,7 @@
 
 import numpy as np
 import meshcat
+from scipy.linalg import sqrtm
 
 from pydrake.solvers.ipopt import IpoptSolver
 from pydrake.solvers.snopt import SnoptSolver
@@ -277,7 +278,16 @@ class SlamBackend:
 
         return J, b, sigmas
 
-    def calc_inner_layer(self, dX_WB, l_xy_e):
+    def calc_info_matrix(self, X_WB_e, l_xy_e):
+        J, b, sigmas = self.calc_jacobian_and_b(X_WB_e, l_xy_e)
+        I = 1 / sigmas ** 2
+        Omega = (J.T * I).dot(J)
+        q = J.T.dot(I * b)
+        c = (b * I).dot(b)
+
+        return Omega, q, c
+
+    def calc_A_lower_half(self, dX_WB, l_xy_e):
         """
         Algorithm 4 in the paper.
         :param dX_WB: [l, self.dim_X]. Input for time steps [l : ].
@@ -286,7 +296,6 @@ class SlamBackend:
         # X_WB_e: belief. e stands for "estimated".
         # X_WB_p: prediction. corresponds to quantities with an overbar.
         n_p = len(self.X_WB_e_dict)
-        k = n_p - 1  # current time step.
         l = len(dX_WB)
 
         # future predictions.
@@ -309,22 +318,22 @@ class SlamBackend:
         n_rows = l * self.dim_X + 2 * nl_measurements
         n_cols = l * self.dim_X + n_Xk
 
-        # A is the lower half of \mathcal{A} in Eq. (32), i.e. [F; H].
-        A = np.zeros((n_rows, n_cols))
+        # A2 is the lower half of \mathcal{A} in Eq. (32), i.e. [F; H].
+        A2 = np.zeros((n_rows, n_cols))
 
         # dynamics
         for i in range(l):
-            i0 = (k + i) * self.dim_X
+            i0 = i * self.dim_X
             i1 = i0 + self.dim_X
 
-            A[i0: i1, n_Xk + i0: n_Xk + i1] = \
+            A2[i0: i1, n_Xk + i0: n_Xk + i1] = \
                 np.eye(self.dim_X) / self.sigma_dynamics
 
             if i == 0:
-                A[i0: i1, (n_p - 1) * self.dim_X: n_p * self.dim_X] = \
+                A2[i0: i1, (n_p - 1) * self.dim_X: n_p * self.dim_X] = \
                     -np.eye(self.dim_X) / self.sigma_dynamics
             else:
-                A[i0: i1, n_Xk + i0 - self.dim_X: n_Xk + i1 - self.dim_X] = \
+                A2[i0: i1, n_Xk + i0 - self.dim_X: n_Xk + i1 - self.dim_X] = \
                     -np.eye(self.dim_X) / self.sigma_dynamics
 
         # observations
@@ -337,16 +346,54 @@ class SlamBackend:
                 j_start_l = n_p * self.dim_X + idx_j * self.dim_l
 
                 self.calc_range_derivatives(
-                    A, i_row, j_start_x, j_start_l, d_xy,
+                    A2, i_row, j_start_x, j_start_l, d_xy,
                     sigma=self.sigma_range)
 
                 self.calc_bearing_derivatives(
-                    A, i_row + 1, j_start_x, j_start_l,
+                    A2, i_row + 1, j_start_x, j_start_l,
                     X_WB_p[i], l_xy_e[idx_j], sigma=self.sigma_bearing)
 
                 i_row += 2
 
-        return A
+        return A2, X_WB_p
+
+    def calc_inner_layer(self, dX_WB, l_xy_e, I_Xk):
+        """
+
+        :param dX_WB:
+        :param X_WB_e:
+        :param l_xy_e:
+        :param I_Xk: information matrix of current trajetory and landmarks.
+        :return:
+        """
+        n_Xk = I_Xk.shape[0]  # size of states up to now.
+        l = len(dX_WB)
+
+        def calc_I(A2):
+            n_Xl = A2.shape[1] - n_Xk  # size of states into the future.
+            n_X = n_Xk + n_Xl
+
+            A21 = A2[:, :n_Xk]
+            A22 = A2[:, n_Xk:]
+
+            # I_X{k+l} = A.T.dot(A)
+            I = np.zeros((n_X, n_X), dtype=dX_WB.dtype)
+            I[:n_Xk, :n_Xk] = I_Xk + A21.T.dot(A21)
+            I[:n_Xk, n_Xk:] = A21.T.dot(A22)
+            I[n_Xk:, :n_Xk] = I[:n_Xk, n_Xk:].T
+            I[n_Xk:, n_Xk:] = A22.T.dot(A22)
+
+            return I
+
+        # lower half of A
+        A2_full, X_WB_p = self.calc_A_lower_half(dX_WB, l_xy_e)
+        I_e = calc_I(A2_full)  # including landmarks.
+        I_p = calc_I(A2_full[:l*self.dim_X])
+
+        return I_e, I_p, X_WB_p
+        # A1 = np.hstack([sqrtm(I_Xk), np.zeros((n_Xk, n_Xl))])
+        # A = np.vstack([A1, A2])
+        # return A.T.dot(A)
 
     def calc_pose_predictions(self, dX_WB):
         l = len(dX_WB)
@@ -358,7 +405,7 @@ class SlamBackend:
             if i == 0:
                 X_WB_p[i] = X_WB_e_k + dX_WB[i]
             else:
-                X_WB_p[i] = X_WB_p[i - 1]
+                X_WB_p[i] = X_WB_p[i - 1] + dX_WB[i]
 
         return X_WB_p
 
@@ -377,13 +424,7 @@ class SlamBackend:
 
         steps_counter = 0
         while True:
-            J, b, sigmas = self.calc_jacobian_and_b(X_WB_e, l_xy_e)
-            I = 1 / sigmas ** 2
-            # I = np.eye(len(b))
-            # I[-self.dim_X:] = 1000
-            Omega = (J.T * I).dot(J)
-            q = J.T.dot(I * b)
-            c = (b * I).dot(b)
+            Omega, q, c = self.calc_info_matrix(X_WB_e, l_xy_e)
             prog = mp.MathematicalProgram()
 
             dX_WB_e = prog.NewContinuousVariables(n_p, dim_X, "dX_WB_e")
@@ -418,11 +459,9 @@ class SlamBackend:
 
         print("\nStep ", n_o)
         print("optimal cost: ", optimal_cost)
-        print("b norm: ", np.linalg.norm(b))
         _, b, _ = self.calc_jacobian_and_b(X_WB_e, l_xy_e)
         print("b norm recalculated: ", np.linalg.norm(b))
         print("total gradient steps: ", steps_counter)
-        print("gradient norm: ", np.linalg.norm(J.T.dot(b)))
         print("dx norm: ", np.linalg.norm(dx_values))
         Omega_pose = self.marginalize_info_matrix(Omega, n_p, n_l)
         print("Marginalized covariance diagonal\n",
