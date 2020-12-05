@@ -13,7 +13,7 @@ from slam_frontend import SlamFrontend, calc_angle_diff
 
 
 class SlamBackend:
-    def __init__(self, X_WB_e_0, frontend: SlamFrontend):
+    def __init__(self, frontend: SlamFrontend):
         """
         Indices (consistent with Indelman2015, aka "the paper".)
             Constants:
@@ -29,7 +29,7 @@ class SlamBackend:
             robot position, used to anchor the entire trajectory.
         """
         self.solver = GurobiSolver()
-        self.X_WB_e_0 = X_WB_e_0.copy()
+        self.X_WB_e_0 = np.zeros(2)
 
         self.dim_l = 2  # dimension of landmarks.
         self.dim_X = 2  # dimension of poses.
@@ -415,7 +415,7 @@ class SlamBackend:
 
         return X_WB_p
 
-    def calc_objective(self, dX_WB, X_WB_e, l_xy_e, X_WB_g):
+    def calc_objective(self, dX_WB, X_WB_e, l_xy_e, X_WB_g, alpha):
         """
         Algorithm 3 in the paper.
         :return:
@@ -464,9 +464,101 @@ class SlamBackend:
 
         c_c2 = Q_kL.dot(D).diagonal().sum()
 
-        return c_a, c_b, c_c1, c_c2
+        c = c_a + alpha * c_b + (1 - alpha) * (c_c1 + c_c2)
 
-    def run_bundle_adjustment(self):
+        return {"c": c, "c_a": c_a, "c_b": c_b, "c_c1": c_c1, "c_c2": c_c2,
+                "predicted_uncertainty_L":
+                    Cov_p_L[-self.dim_X:, -self.dim_X:].diagonal().sum()}
+
+    def calc_objective_gradient(self, dX_WB, X_WB_e, l_xy_e, X_WB_g, alpha):
+        """
+        Algorithm 2 in the paper.
+        :param dX_WB:
+        :param X_WB_e:
+        :param l_xy_e:
+        :param X_WB_g: goal.
+        :return:
+        """
+        Dc = np.zeros_like(dX_WB.ravel())
+
+        h = 1e-3
+        for i in range(len(Dc)):
+            dX_WB_new = dX_WB.copy()
+            dX_WB_new.ravel()[i] += h
+            c_new1 = self.calc_objective(
+                dX_WB_new, X_WB_e, l_xy_e, X_WB_g, alpha)["c"]
+
+            dX_WB_new.ravel()[i] -= 2 * h
+            c_new2 = self.calc_objective(
+                dX_WB_new, X_WB_e, l_xy_e, X_WB_g, alpha)["c"]
+
+            Dc[i] = (c_new1 - c_new2) / h / 2
+
+        Dc.resize(dX_WB.shape)
+
+        return Dc
+
+    def run_gradient_descent(self, dX_WB0, X_WB_e, l_xy_e, X_WB_g, alpha):
+        """
+        Algorithm 1 in the paper.
+        :return:
+        """
+        dX_WB = dX_WB0.copy()
+        iter_count = 0
+
+        a = 0.4
+        b = 0.5
+        epsilon = 2e-3
+
+        while True:
+            D_dX_WB = self.calc_objective_gradient(
+                dX_WB, X_WB_e, l_xy_e, X_WB_g, alpha)
+            c0 = self.calc_objective(
+                dX_WB, X_WB_e, l_xy_e, X_WB_g, alpha)["c"]
+            print("\nIteration {}, cost {}".format(iter_count, c0))
+
+            # line search
+            t = 1.
+            line_search_count = 0
+            while True:
+                result = self.calc_objective(
+                    dX_WB - t * D_dX_WB, X_WB_e, l_xy_e, X_WB_g, alpha)
+                c_t = result["c"]
+                if c_t < c0 - a * t * (
+                        D_dX_WB ** 2).sum() or line_search_count > 10:
+                    break
+                # print("count {}, c_t {}, ".format(line_search_count, c_t))
+                t *= b
+                line_search_count += 1
+
+            dX_WB -= t * D_dX_WB
+
+            print("Line search steps {}, gradient {}".format(
+                line_search_count, np.linalg.norm(D_dX_WB)))
+            print(result)
+            iter_count += 1
+
+            # termination
+            is_cost_reduction_small = abs((c_t - c0) / c_t) < epsilon
+            is_gradient_small = np.linalg.norm(D_dX_WB) < epsilon
+            if is_cost_reduction_small or is_gradient_small or iter_count > 50:
+                break
+
+        return dX_WB, result
+
+    def initialize_dX_WB(self, X_WB_0, X_WB_g, L):
+        """
+
+        :param X_WB_0: current robot pose.
+        :param X_WB_g: goal robot pose.
+        :param L: number of time steps.
+        :return:
+        """
+        dX_WB = np.zeros((L, X_WB_0.size))
+        dX_WB[:] = (X_WB_g - X_WB_0) / L
+        return dX_WB
+
+    def run_bundle_adjustment(self, is_printing=False):
         dim_l = self.dim_l  # dimension of landmarks.
         dim_X = self.dim_X  # dimension of poses.
 
@@ -514,18 +606,19 @@ class SlamBackend:
 
         self.update_beliefs(X_WB_e, l_xy_e, Omega)
 
-        print("\nStep ", n_o)
-        print("optimal cost: ", optimal_cost)
-        _, b, _ = self.calc_jacobian_and_b(X_WB_e, l_xy_e)
-        print("b norm recalculated: ", np.linalg.norm(b))
-        print("total gradient steps: ", steps_counter)
-        print("dx norm: ", np.linalg.norm(dx_values))
-        Omega_pose = self.marginalize_info_matrix(Omega, n_p, n_l)
-        print("Marginalized covariance diagonal\n",
-              np.linalg.inv(Omega_pose).diagonal())
-        print("Covariance diagonal\n",
-              np.linalg.inv(Omega).diagonal()[:self.dim_X * n_p])
-        print("\n")
+        if is_printing:
+            print("\nStep ", n_o)
+            print("optimal cost: ", optimal_cost)
+            _, b, _ = self.calc_jacobian_and_b(X_WB_e, l_xy_e)
+            print("b norm recalculated: ", np.linalg.norm(b))
+            print("total gradient steps: ", steps_counter)
+            print("dx norm: ", np.linalg.norm(dx_values))
+            Omega_pose = self.marginalize_info_matrix(Omega, n_p, n_l)
+            print("Marginalized covariance diagonal\n",
+                  np.linalg.inv(Omega_pose).diagonal())
+            Cov = np.linalg.inv(Omega)
+            print("Sqrt covariance trace\n", np.sqrt(Cov.diagonal().sum()))
+            print("\n")
 
         return X_WB_e, l_xy_e
 
@@ -556,11 +649,21 @@ class SlamBackend:
         return future_landmark_measurements
 
     def draw_estimated_path(self):
-        nt = len(self.X_WB_e_dict)
-        t_xy_e = np.zeros((nt, 2))
-        for i in range(nt):
+        n_p = len(self.X_WB_e_dict)
+        t_xy_e = np.zeros((n_p, 2))
+        for i in range(n_p):
             t_xy_e[i] = self.X_WB_e_dict[i][:2]
-        self.draw_robot_path(t_xy_e, color=[1, 0, 0], prefix="robot_poses_e")
+        self.draw_robot_path(t_xy_e, color=[1, 0, 0], prefix="robot_poses_e",
+                             idx_segment=0, size=0.2)
+
+    def draw_estimated_path_segment(self, L: int, idx_segment: int):
+        n_p = len(self.X_WB_e_dict)
+        t_xy_e = np.zeros((L, 2))
+
+        for i in range(L):
+            t_xy_e[i] = self.X_WB_e_dict[n_p - L + i]
+        self.draw_robot_path(t_xy_e, color=[1, 0, 0], prefix="robot_poses_e",
+                             idx_segment=idx_segment, size=0.2)
 
     def draw_estimated_landmarks(self):
         nl = len(self.l_xy_e_dict)
@@ -581,19 +684,20 @@ class SlamBackend:
             meshcat.geometry.PointCloud(
                 position=l_xy_e.T, color=point_colors.T, size=0.1))
 
-    def draw_robot_path(self, X_WBs, color, prefix: str):
+    def draw_robot_path(self, X_WBs, color, prefix: str,
+                        idx_segment: int, size=0.2):
         t_xy = X_WBs[:, :2]
         for i in range(1, len(t_xy)):
             points = np.zeros((2, 3))
             points[0, :2] = t_xy[i - 1]
             points[1, :2] = t_xy[i]
-            self.vis[prefix]["path"][str(i)].set_object(
+            self.vis[prefix][str(idx_segment)]["path"][str(i)].set_object(
                 meshcat.geometry.Line(
                     meshcat.geometry.PointsGeometry(points.T)))
 
         t_xy3 = np.vstack((t_xy.T, np.zeros(len(t_xy)))).T
         point_colors = np.zeros_like(t_xy3)
         point_colors[:] = color
-        self.vis[prefix]["points"].set_object(
+        self.vis[prefix][str(idx_segment)]["points"].set_object(
             meshcat.geometry.PointCloud(
-                position=t_xy3.T, color=point_colors.T, size=0.2))
+                position=t_xy3.T, color=point_colors.T, size=size))
