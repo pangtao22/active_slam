@@ -19,40 +19,57 @@ def calc_angle_sum(angle1, angle2):
     return sum12
 
 
+def set_orthographic_camera_xy(vis: meshcat.Visualizer):
+    # use orthographic camera, show xy plane.
+    camera = meshcat.geometry.OrthographicCamera(
+        left=-5, right=5, bottom=-5, top=5, near=-1000, far=1000)
+    vis['/Cameras/default/rotated'].set_object(camera)
+    vis['/Cameras/default/rotated/<object>'].set_property(
+        "position", [0, 0, 0])
+    vis['/Cameras/default'].set_transform(
+        meshcat.transformations.translation_matrix([0, 0, 1]))
+
+
 class SlamFrontend:
     def __init__(self, num_landmarks: int, seed: int):
         random.seed(seed)
 
         self.nl = num_landmarks
         # edge length of the square in which the robot runs.
-        bbox_length = 5.
-        self.x_min = -bbox_length / 2
-        self.y_min = -bbox_length / 2
-        self.x_max = bbox_length / 2
-        self.y_max = bbox_length / 2
+        bbox_length = 1
         self.box_length = bbox_length
 
         self.r_range_max = 1
         self.r_range_min = 0.2
 
         # coordinates of landmarks.
-        # self.l_xy = random.rand(self.nl, 2) * bbox_length - bbox_length / 2 +\
-        #             np.array([-1.5, 1.3])
-        self.l_xy = np.array([[0, 0.5], [-0.6, 0.1], [-0.7, -0.2]])
+        self.l_xy = random.rand(self.nl, 2) * bbox_length - bbox_length / 2
+                    # np.array([-1.5, 1.3])
+        # self.l_xy = np.array([[0, 0.5], [-0.6, 0.1], [-0.7, -0.2]])
 
         # visualizer
         self.vis = meshcat.Visualizer(zmq_url="tcp://127.0.0.1:6000")
         self.vis.delete()
+        x_min = -min(self.l_xy[:, 0]) - 1
+        x_max = max(self.l_xy[:, 0]) + 1
+        y_min = -min(self.l_xy[:, 1]) - 1
+        y_max = max(self.l_xy[:, 1]) + 1
+        set_orthographic_camera_xy(self.vis)
         self.draw_landmarks()
 
         # initialize robot
         self.X_WB = meshcat.transformations.rotation_matrix(
             np.pi/2, np.array([1., 0, 0]), np.zeros(3))
-        material = meshcat.geometry.MeshLambertMaterial(
-            color=0xfcfcfc, opacity=0.3)
-        self.vis["robot"].set_object(
-            meshcat.geometry.Cylinder(height=0.05, radius=self.r_range_max),
-            material)
+        material0 = meshcat.geometry.MeshLambertMaterial(
+            color=0xff0000, opacity=1.0)
+        material1 = meshcat.geometry.MeshLambertMaterial(
+            color=0xff0000, opacity=0.2)
+        self.vis["robot"]["sensing"].set_object(
+            meshcat.geometry.Cylinder(height=0.005, radius=self.r_range_max),
+            material1)
+        self.vis["robot"]["body"].set_object(
+            meshcat.geometry.Cylinder(height=0.2, radius=0.075),
+            material0)
         self.vis["robot"].set_transform(self.X_WB)
 
         # noise
@@ -60,17 +77,20 @@ class SlamFrontend:
         self.sigma_range = 0.05
         self.sigma_bearing = 0.05
         # von-mises distribution.
-        self.kappa_bearing = 1 / self.sigma_bearing **2
+        self.kappa_bearing = 1 / self.sigma_bearing ** 2
+
+    def draw_box(self, prefix, lengths, color, p):
+        self.vis[prefix].set_object(
+            meshcat.geometry.Box(lengths),
+            meshcat.geometry.MeshLambertMaterial(color=color))
+        X = np.eye(4)
+        X[:2, 3] = p
+        self.vis[prefix].set_transform(X)
 
     def draw_landmarks(self):
-        l_xyz = np.zeros((self.nl, 3))
-        l_xyz[:, :2] = self.l_xy
-        colors = np.zeros_like(l_xyz.T)
-        colors[2] = 1.
-        self.vis["landmarks"].set_object(
-            meshcat.geometry.PointCloud(position=l_xyz.T,
-                                        color=colors,
-                                        size=0.1))
+        for i, l_xy_i in enumerate(self.l_xy):
+            prefix = "landmarks/{}".format(i)
+            self.draw_box(prefix, [0.1, 0.1, 0.1], 0x0000ff, l_xy_i)
 
     def get_true_landmark_positions(self, landmark_idx):
         return self.l_xy[landmark_idx]

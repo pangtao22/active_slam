@@ -24,13 +24,13 @@ X_WBs[8, :2] = X_WBs[7, :2] + [1.5, 2.5]
 X_WBs[9, :2] = X_WBs[8, :2] + [1.5, -2]
 
 
-frontend = SlamFrontend(num_landmarks=50, seed=16485)
+frontend = SlamFrontend(num_landmarks=5, seed=16485)
 backend = SlamBackend(frontend)
 
 frontend.draw_robot(X_WBs[0])
 print(frontend.get_landmark_measurements(X_WBs[0]))
-backend.draw_robot_path(X_WBs, color=[0, 1, 0], prefix="robot_gt",
-                        idx_segment=0)
+backend.draw_robot_path(X_WBs, color=0x00ff00, prefix="goals",
+                        idx_segment=0, size=0.075)
 
 #%%
 X_WB_e0 = backend.get_X_WB_initial_guess_array()
@@ -51,7 +51,7 @@ for t in range(10):
     X_WB_e, l_xy_e = backend.run_bundle_adjustment()
 
     frontend.draw_robot(backend.X_WB_e_dict[t])
-    backend.draw_estimated_path()
+    backend.draw_estimated_path_segment(None, 0)
     backend.draw_estimated_landmarks()
     print("robot pose estimated: ", X_WB_e[-1])
     print("robot_pose true: ", X_WBs[t])
@@ -61,8 +61,8 @@ for t in range(10):
 
 #%%
 dX_WB = np.zeros((10, 2))
-dX_WB[:, 0] = 0.05
-dX_WB[:, 1] = 0.05
+dX_WB[:5, 0] = 0.5
+dX_WB[5:, 0] = -0.5
 
 # dX_WB = np.random.rand(10, 2)
 X_WB_p = backend.calc_pose_predictions(dX_WB)
@@ -72,14 +72,13 @@ X_WB_e_list = backend.get_X_WB_belief()
 l_xy_e_list = backend.get_l_xy_belief()
 
 Omega, q, c = backend.calc_info_matrix(X_WB_e_list, l_xy_e_list)
-A2, X_WB_p = backend.calc_A_lower_half(dX_WB, l_xy_e_list)
-I_e, I_p, X_WB_p, A2 = backend.calc_inner_layer(dX_WB, l_xy_e_list, Omega)
-Cov_e = inv(I_e)
-Cov_p = inv(I_p)
+result = backend.calc_A_lower_half(dX_WB, l_xy_e_list)
+result = backend.calc_inner_layer(dX_WB, l_xy_e_list, Omega)
+
+Cov_e = inv(result["I_e"])
+Cov_p = inv(result["I_p"])
 print("Cov_e", Cov_e.diagonal())
 print("Cov_p", Cov_p.diagonal())
-
-
 
 
 #%%
@@ -96,17 +95,27 @@ a.derivatives().reshape(dX_WB.shape)
 
 #%%
 A2_ad = backend.calc_A_lower_half(dX_WB_ad, l_xy_e_list)
-I_e_ad, I_p, X_WB_p_ad, _ = backend.calc_inner_layer(
-    dX_WB_ad, l_xy_e_list, Omega)
+result = backend.calc_inner_layer(dX_WB_ad, l_xy_e_list, Omega)
+
+I_e_ad = result["I_e"]
+I_p = result["I_p"]
+# X_WB_p_ad = result["X_WB_p"]
+
 Cov_e_ad = inv(I_e_ad)
 Cov_p_ad = inv(I_p)
 print("Cov_e_ad", autoDiffToValueMatrix(Cov_e_ad).diagonal())
 print("Cov_p_ad", autoDiffToValueMatrix(Cov_p_ad).diagonal())
 
 #%%
+X_WB_g = X_WB_p[5]  # arbitray
 c_ad = backend.calc_objective(
-    dX_WB_ad, X_WB_e_list, l_xy_e_list, X_WB_p[-1], alpha=0.5)
+    dX_WB_ad, X_WB_e_list, l_xy_e_list, X_WB_g, alpha=0.5)
 print(c_ad["c"].derivatives())
+
+
+#%% numerical diff
+backend.calc_objective_gradient(
+    dX_WB, X_WB_e_list, l_xy_e_list, X_WB_g, 0.5)
 
 # %% numerical diff
 Dc = np.zeros_like(dX_WB.ravel())

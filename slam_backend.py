@@ -1,7 +1,6 @@
 
 import numpy as np
 import meshcat
-from scipy.linalg import sqrtm
 
 from pydrake.solvers.ipopt import IpoptSolver
 from pydrake.solvers.snopt import SnoptSolver
@@ -33,9 +32,11 @@ class SlamBackend:
 
         self.dim_l = 2  # dimension of landmarks.
         self.dim_X = 2  # dimension of poses.
+        self.dim_measurements = 2
 
         # current beliefs
         self.X_WB_e_dict = {0: self.X_WB_e_0}
+        self.X_WB_e_var_dict = {}
         self.l_xy_e_dict = dict()
 
         # Information matrix of current robot poses and landmarks, which are
@@ -55,9 +56,10 @@ class SlamBackend:
         self.landmark_measurements = dict()
 
         # Taking stuff from frontend
+        self.frontend = frontend
         self.vis = frontend.vis
         self.l_xy = frontend.l_xy
-        #TODO: load from config file?
+        # TODO: load from config file?
         self.sigma_odometry = frontend.sigma_odometry
         self.sigma_range = frontend.sigma_range
         self.sigma_bearing = frontend.sigma_bearing
@@ -224,8 +226,8 @@ class SlamBackend:
         nl_measurements = self.calc_num_landmark_measurements(
             self.landmark_measurements)
 
-        n_rows = n_o * dim_X + nl_measurements * dim_l + self.dim_X
-        n_cols = (n_o + 1) * dim_X + nl * 2
+        n_rows = (n_o + 1) * dim_X + nl_measurements * self.dim_measurements
+        n_cols = (n_o + 1) * dim_X + nl * dim_l
         J = np.zeros((n_rows, n_cols))
         b = np.zeros(n_rows)
         sigmas = np.zeros(n_rows)
@@ -283,12 +285,12 @@ class SlamBackend:
 
     def calc_info_matrix(self, X_WB_e, l_xy_e):
         J, b, sigmas = self.calc_jacobian_and_b(X_WB_e, l_xy_e)
-        I = 1 / sigmas ** 2
-        Omega = (J.T * I).dot(J)
-        q = J.T.dot(I * b)
-        c = (b * I).dot(b)
+        Omega = 1 / sigmas ** 2
+        I = (J.T * Omega).dot(J)
+        q = J.T.dot(Omega * b)
+        c = (b * Omega).dot(b)
 
-        return Omega, q, c
+        return I, q, c
 
     def calc_A_lower_half(self, dX_WB, l_xy_e):
         """
@@ -307,58 +309,82 @@ class SlamBackend:
         # Find the visible landmarks for every X_WB_p[i].
         # Store in {i: [landmark order indices.]}, i.e. the same order as
         #   self.landmark_measurements.
-        future_landmark_measurements = self.find_visible_landmarks(X_WB_p)
+        # future_landmark_measurements = self.find_visible_landmarks(X_WB_p)
         nl = len(self.landmark_measurements)  # number of landmarks
         # number of new landmark measurements
-        nl_measurements = self.calc_num_landmark_measurements(
-            future_landmark_measurements)
+        nl_measurements = l * nl
 
         # Structure of new "state"
         # [X_WB_0, ... X_WB_{k},
         #  l_xy (all landmarks),
         #  X_WB_{k+1}, ... X_WB_{k+l}]
         n_Xk = n_p * self.dim_X + nl * self.dim_l
-        n_rows = l * self.dim_X + 2 * nl_measurements
+        n_rows_F = l * self.dim_X
+        n_rows_H = 2 * nl_measurements
         n_cols = l * self.dim_X + n_Xk
 
-        # A2 is the lower half of \mathcal{A} in Eq. (32), i.e. [F; H].
-        A2 = np.zeros((n_rows, n_cols), dtype=dX_WB.dtype)
+        # F_whitened is devided by sigma_w.
+        F_whitened = np.zeros((n_rows_F, n_cols), dtype=dX_WB.dtype)
+        # H is the original Jacobian, before divided by sigma_v.
+        H = np.zeros((n_rows_H, n_cols), dtype=dX_WB.dtype)
+        # as defined in Eq. (33)
+        Omega_v_bar_sqrt = np.zeros(n_rows_H)
+        Omega_v_sqrt = np.zeros(n_rows_H)
 
-        # dynamics
+        # dynamics, F_whitened.
         for i in range(l):
             i0 = i * self.dim_X
             i1 = i0 + self.dim_X
 
-            A2[i0: i1, n_Xk + i0: n_Xk + i1] = \
+            F_whitened[i0: i1, n_Xk + i0: n_Xk + i1] = \
                 np.eye(self.dim_X) / self.sigma_dynamics
 
             if i == 0:
-                A2[i0: i1, (n_p - 1) * self.dim_X: n_p * self.dim_X] = \
+                j0 = (n_p - 1) * self.dim_X
+                j1 = n_p * self.dim_X
+                F_whitened[i0: i1, j0: j1] = \
                     -np.eye(self.dim_X) / self.sigma_dynamics
             else:
-                A2[i0: i1, n_Xk + i0 - self.dim_X: n_Xk + i1 - self.dim_X] = \
+                j0 = n_Xk + i0 - self.dim_X
+                j1 = n_Xk + i1 - self.dim_X
+                F_whitened[i0: i1, j0: j1] = \
                     -np.eye(self.dim_X) / self.sigma_dynamics
 
-        # observations
-        i_row = l * self.dim_X
-        for idx_j, (j, visible_robot_poses) in enumerate(
-                future_landmark_measurements.items()):
-            for i in visible_robot_poses.keys():
+        # observations, H.
+        i_row = 0
+        for idx_j in range(nl):
+            for i in range(l):
                 d_xy = X_WB_p[i] - l_xy_e[idx_j]
                 j_start_x = n_Xk + i * self.dim_X
                 j_start_l = n_p * self.dim_X + idx_j * self.dim_l
 
                 self.calc_range_derivatives(
-                    A2, i_row, j_start_x, j_start_l, d_xy,
-                    sigma=self.sigma_range)
+                    H, i_row, j_start_x, j_start_l, d_xy, sigma=1)
 
                 self.calc_bearing_derivatives(
-                    A2, i_row + 1, j_start_x, j_start_l,
-                    X_WB_p[i], l_xy_e[idx_j], sigma=self.sigma_bearing)
+                    H, i_row + 1, j_start_x, j_start_l,
+                    X_WB_p[i], l_xy_e[idx_j], sigma=1)
+
+                d = np.linalg.norm(d_xy)
+                if d > 5 * self.r_range_max:
+                    p_visible = 0.
+                else:
+                    p_visible = 1.
+
+                Omega_v_bar_sqrt[i_row] = p_visible / self.sigma_range
+                Omega_v_bar_sqrt[i_row + 1] = p_visible / self.sigma_bearing
+                Omega_v_sqrt[i_row] = 1 / self.sigma_range
+                Omega_v_sqrt[i_row + 1] = 1 / self.sigma_bearing
 
                 i_row += 2
 
-        return A2, X_WB_p
+        # A2 is the lower half of \mathcal{A} in Eq. (32),
+        #   i.e. [F_whitened; H / Omega_v_sqrt].
+        A2 = np.vstack([F_whitened, (H.T * Omega_v_bar_sqrt).T])
+
+        return {"A2": A2, "X_WB_p": X_WB_p, "H": H, "F_whitened": F_whitened,
+                "Omega_v_bar_sqrt": Omega_v_bar_sqrt,
+                "Omega_v_sqrt": Omega_v_sqrt}
 
     def calc_inner_layer(self, dX_WB, l_xy_e, I_Xk):
         """
@@ -370,7 +396,6 @@ class SlamBackend:
         :return:
         """
         n_Xk = I_Xk.shape[0]  # size of states up to now.
-        l = len(dX_WB)
 
         def calc_I(A2, dtype):
             n_Xl = A2.shape[1] - n_Xk  # size of states into the future.
@@ -389,16 +414,13 @@ class SlamBackend:
             return I
 
         # lower half of A
-        A2, X_WB_p = self.calc_A_lower_half(dX_WB, l_xy_e)
+        result = self.calc_A_lower_half(dX_WB, l_xy_e)
         # including landmarks.
-        I_e = calc_I(A2, dtype=object)
+        result["I_e"] = calc_I(result["A2"], dtype=object)
         # excluding landmarks.
-        I_p = calc_I(A2[: l * self.dim_X], dtype=np.float)
+        result["I_p"] = calc_I(result["F_whitened"], dtype=np.float)
 
-        return I_e, I_p, X_WB_p, A2
-        # A1 = np.hstack([sqrtm(I_Xk), np.zeros((n_Xk, n_Xl))])
-        # A = np.vstack([A1, A2])
-        # return A.T.dot(A)
+        return result
 
     def calc_pose_predictions(self, dX_WB):
         L = len(dX_WB)
@@ -421,7 +443,7 @@ class SlamBackend:
         :return:
         """
         L = len(dX_WB)
-        Omega, _, _ = self.calc_info_matrix(X_WB_e, l_xy_e)
+        I_k, _, _ = self.calc_info_matrix(X_WB_e, l_xy_e)
 
         # (a) in eq. (41).
         c_a = (dX_WB * self.M_u * dX_WB).sum()
@@ -429,43 +451,36 @@ class SlamBackend:
         # (b) in eq. (41).
         c_b = 0.
         for l in range(L):
-            I_e_l, I_p_l, X_WB_p_l, A2_l = self.calc_inner_layer(
-                dX_WB[:l + 1], l_xy_e, Omega)
-            Cov_e_l = inv(I_e_l)
+            result_l = self.calc_inner_layer(dX_WB[:l + 1], l_xy_e, I_k)
+            Cov_e_l = inv(result_l["I_e"])
             c_b += Cov_e_l[-self.dim_X:, -self.dim_X:].diagonal().sum()
 
         Cov_e_L = Cov_e_l
-        Cov_p_L = inv(I_p_l)
-        X_WB_p_L = X_WB_p_l
-        A2_L = A2_l
+        Cov_p_L = inv(result_l["I_p"])
+        X_WB_p_L = result_l["X_WB_p"]
+        A2_L = result_l["A2"]
+        Omega_v_sqrt = result_l["Omega_v_sqrt"]
+        Omega_v_bar_sqrt = result_l["Omega_v_bar_sqrt"]
 
         # (c) in eq. (41)
         c_c1 = ((X_WB_p_L[-1] - X_WB_g)**2).sum()
 
-        H_kL = A2_L[L * self.dim_X:]
-        J_kL = H_kL.copy()
-        J_kL[0::2] *= self.sigma_range
-        J_kL[1::2] *= self.sigma_bearing
+        H_whitened_kL = A2_L[L * self.dim_X:]
+        H_kL = result_l["H"]
 
         # B.shape = (self.dim_X, m2),
         #   where m2 is the number of range and bearing measurements of
         #   the trajectory X_WB_p_L.
-        B = Cov_e_L[-self.dim_X:].dot(H_kL.T)
-        B[:, 0::2] /= self.sigma_range
-        B[:, 1::2] /= self.sigma_bearing
+        B = Cov_e_L[-self.dim_X:].dot(H_whitened_kL.T) * Omega_v_bar_sqrt
         Q_kL = B.T.dot(B)
 
-        Omega_v = np.zeros(B.shape[1])
-        Omega_v[0::2] = self.sigma_range**2
-        Omega_v[1::2] = self.sigma_bearing**2
-
-        D = J_kL.dot(Cov_p_L).dot(J_kL.T)
-        D[np.diag_indices_from(D)] += Omega_v
+        D = H_kL.dot(Cov_p_L).dot(H_kL.T)
+        D[np.diag_indices_from(D)] += 1 / Omega_v_sqrt ** 2
 
         c_c2 = Q_kL.dot(D).diagonal().sum()
 
-        c = c_a + alpha * c_b + (1 - alpha) * (c_c1 + c_c2)
-
+        c = c_a + alpha * (c_b * 50) + (1 - alpha) * (c_c1 + c_c2)
+        # c = alpha * (c_b) + (1 - alpha) * (c_c1)
         return {"c": c, "c_a": c_a, "c_b": c_b, "c_c1": c_c1, "c_c2": c_c2,
                 "predicted_uncertainty_L":
                     Cov_p_L[-self.dim_X:, -self.dim_X:].diagonal().sum()}
@@ -513,12 +528,13 @@ class SlamBackend:
         while True:
             D_dX_WB = self.calc_objective_gradient(
                 dX_WB, X_WB_e, l_xy_e, X_WB_g, alpha)
-            c0 = self.calc_objective(
-                dX_WB, X_WB_e, l_xy_e, X_WB_g, alpha)["c"]
-            print("\nIteration {}, cost {}".format(iter_count, c0))
+            result = self.calc_objective(
+                dX_WB, X_WB_e, l_xy_e, X_WB_g, alpha)
+            c0 = result["c"]
+            print("\nIteration {}, cost \n".format(iter_count), result)
 
             # line search
-            t = 1.
+            t = 1
             line_search_count = 0
             while True:
                 result = self.calc_objective(
@@ -541,12 +557,12 @@ class SlamBackend:
             # termination
             is_cost_reduction_small = abs((c_t - c0) / c_t) < epsilon
             is_gradient_small = np.linalg.norm(D_dX_WB) < epsilon
-            if is_cost_reduction_small or is_gradient_small or iter_count > 50:
+            if is_cost_reduction_small or is_gradient_small or iter_count > 200:
                 break
 
         return dX_WB, result
 
-    def initialize_dX_WB(self, X_WB_0, X_WB_g, L):
+    def initialize_dX_WB_with_goal(self, X_WB_0, X_WB_g, L, max_step=0.2):
         """
 
         :param X_WB_0: current robot pose.
@@ -554,8 +570,26 @@ class SlamBackend:
         :param L: number of time steps.
         :return:
         """
+        step = (X_WB_g - X_WB_0) / L
+        step_size = np.linalg.norm(step)
+        step /= step_size
+        step *= min(step_size, max_step)
+
         dX_WB = np.zeros((L, X_WB_0.size))
-        dX_WB[:] = (X_WB_g - X_WB_0) / L
+        dX_WB[:] = step
+
+        return dX_WB
+
+    def initialize_dX_WB_with_fixed_input(self, X_WB_0, dX_WB0, L):
+        """
+
+        :param X_WB_0: current robot pose.
+        :param dX_WB0: fixed input.
+        :param L: number of time steps.
+        :return:
+        """
+        dX_WB = np.zeros((L, X_WB_0.size))
+        dX_WB[:] = dX_WB0
         return dX_WB
 
     def run_bundle_adjustment(self, is_printing=False):
@@ -573,7 +607,7 @@ class SlamBackend:
 
         steps_counter = 0
         while True:
-            Omega, q, c = self.calc_info_matrix(X_WB_e, l_xy_e)
+            I_k, q, c = self.calc_info_matrix(X_WB_e, l_xy_e)
             prog = mp.MathematicalProgram()
 
             dX_WB_e = prog.NewContinuousVariables(n_p, dim_X, "dX_WB_e")
@@ -581,11 +615,8 @@ class SlamBackend:
             dx = np.hstack((dX_WB_e.ravel(), dl_xy_e.ravel()))
 
             nx = len(dx)
-            prog.AddQuadraticCost(Omega, q, 0.5*c, dx)
-            # prog.AddQuadraticCost(((dx / self.sigma_odometry)**2).sum())
+            prog.AddQuadraticCost(I_k, q, 0.5*c, dx)
             prog.AddQuadraticCost(np.eye(nx) * 2, np.zeros(nx), dx)
-            # prog.AddQuadraticCost(10000 * ((dX_WB_e[0]) ** 2).sum())
-            # prog.AddL2NormCost(J, -b, dx)
 
             result = self.solver.Solve(prog)
             optimal_cost = result.get_optimal_cost()
@@ -604,7 +635,7 @@ class SlamBackend:
                     np.linalg.norm(dx_values) / (n_p + n_l) < 5e-3:
                 break
 
-        self.update_beliefs(X_WB_e, l_xy_e, Omega)
+        self.update_beliefs(X_WB_e, l_xy_e, I_k)
 
         if is_printing:
             print("\nStep ", n_o)
@@ -613,18 +644,32 @@ class SlamBackend:
             print("b norm recalculated: ", np.linalg.norm(b))
             print("total gradient steps: ", steps_counter)
             print("dx norm: ", np.linalg.norm(dx_values))
-            Omega_pose = self.marginalize_info_matrix(Omega, n_p, n_l)
+            Omega_pose = self.marginalize_info_matrix(I_k, n_p, n_l)
             print("Marginalized covariance diagonal\n",
                   np.linalg.inv(Omega_pose).diagonal())
-            Cov = np.linalg.inv(Omega)
+            Cov = np.linalg.inv(I_k)
             print("Sqrt covariance trace\n", np.sqrt(Cov.diagonal().sum()))
             print("\n")
 
         return X_WB_e, l_xy_e
 
     def update_beliefs(self, X_WB_e_values, l_xy_e_values, I_all):
+        Cov = np.linalg.inv(I_all)
+
         for i, X_WB_e in enumerate(X_WB_e_values):
+            i0 = i * self.dim_X
+            i1 = i0 + self.dim_X
             self.X_WB_e_dict[i] = X_WB_e
+            Cov_i = Cov[i0: i1, i0:i1]
+            e_values, e_vectors = np.linalg.eig(Cov_i)
+            X_WB_ellipsoid = np.eye(4)
+            X_WB_ellipsoid[:2, :2] = e_vectors
+            X_WB_ellipsoid[:2, 3] = X_WB_e
+            sigmas = np.sqrt(e_values)
+            self.X_WB_e_var_dict[i] = {
+                "sigmas": np.hstack([sigmas, 0.01]),
+                "transform": X_WB_ellipsoid,
+                "cov": Cov_i}
 
         self.l_xy_e_dict.clear()
         for k, l_xy_e_value in zip(self.landmark_measurements.keys(),
@@ -639,7 +684,7 @@ class SlamBackend:
             for j in self.l_xy_e_dict.keys():
                 d_xy = self.l_xy_e_dict[j] - X_WB
                 d = np.linalg.norm(d_xy)
-                if self.r_range_min < d < self.r_range_max:
+                if self.r_range_min < d:
                     if j not in future_landmark_measurements:
                         future_landmark_measurements[j] = dict()
                     b = np.arctan2(d_xy[1], d_xy[0])
@@ -656,18 +701,38 @@ class SlamBackend:
         self.draw_robot_path(t_xy_e, color=[1, 0, 0], prefix="robot_poses_e",
                              idx_segment=0, size=0.2)
 
-    def draw_estimated_path_segment(self, L: int, idx_segment: int):
+    def draw_estimated_path_segment(self, L: int, idx_segment: int,
+                                    covariance_scale=1.):
         n_p = len(self.X_WB_e_dict)
-        t_xy_e = np.zeros((L, 2))
+        name = "robot_poses_e/{}".format(idx_segment)
+        material = meshcat.geometry.MeshLambertMaterial(
+            color=0xffffff, opacity=0.5)
 
+        if L is None:
+            L = n_p
+
+        points = np.zeros((L, 3))
         for i in range(L):
-            t_xy_e[i] = self.X_WB_e_dict[n_p - L + i]
-        self.draw_robot_path(t_xy_e, color=[1, 0, 0], prefix="robot_poses_e",
-                             idx_segment=idx_segment, size=0.2)
+            idx = n_p - L + i
+            # Draw covariance ellipses.
+            sigmas = self.X_WB_e_var_dict[idx]["sigmas"]
+            sigmas[:2] *= covariance_scale
+            self.vis[name]["points"][str(i)].set_object(
+                meshcat.geometry.Ellipsoid(sigmas), material)
+            self.vis[name]["points"][str(i)].set_transform(
+                self.X_WB_e_var_dict[idx]["transform"])
+
+            points[i, :2] = self.X_WB_e_dict[idx]
+
+        # Draw lines.
+        self.vis[name]["path"].set_object(
+            meshcat.geometry.Line(
+                meshcat.geometry.PointsGeometry(points.T), material))
 
     def draw_estimated_landmarks(self):
         nl = len(self.l_xy_e_dict)
         l_xy_e = np.zeros((nl, 3))
+
         for i, (k, l_xy_e_i) in enumerate(self.l_xy_e_dict.items()):
             l_xy_e[i][:2] = l_xy_e_i
             points = np.zeros((2, 3))
@@ -677,17 +742,21 @@ class SlamBackend:
                 meshcat.geometry.Line(
                     meshcat.geometry.PointsGeometry(points.T)))
 
-        point_colors = np.zeros_like(l_xy_e)
-        point_colors[:, 1] = 1
-        point_colors[:, 2] = 1
-        self.vis["landmarks_e"]["points"].set_object(
-            meshcat.geometry.PointCloud(
-                position=l_xy_e.T, color=point_colors.T, size=0.1))
+            # draw landmark
+            prefix = "landmarks_e/points/{}".format(i)
+            self.frontend.draw_box(
+                prefix, [0.1, 0.1, 0.11], 0x00ffff, l_xy_e_i)
 
     def draw_robot_path(self, X_WBs, color, prefix: str,
                         idx_segment: int, size=0.2):
         t_xy = X_WBs[:, :2]
-        for i in range(1, len(t_xy)):
+        for i in range(0, len(t_xy)):
+            name = prefix + "/{}/points/{}".format(idx_segment, i)
+            self.frontend.draw_box(
+                name, [size, size, 0.15], color, t_xy[i])
+
+            if i == 0:
+                continue
             points = np.zeros((2, 3))
             points[0, :2] = t_xy[i - 1]
             points[1, :2] = t_xy[i]
@@ -695,9 +764,5 @@ class SlamBackend:
                 meshcat.geometry.Line(
                     meshcat.geometry.PointsGeometry(points.T)))
 
-        t_xy3 = np.vstack((t_xy.T, np.zeros(len(t_xy)))).T
-        point_colors = np.zeros_like(t_xy3)
-        point_colors[:] = color
-        self.vis[prefix][str(idx_segment)]["points"].set_object(
-            meshcat.geometry.PointCloud(
-                position=t_xy3.T, color=point_colors.T, size=size))
+
+
