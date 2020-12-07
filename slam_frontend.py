@@ -73,7 +73,7 @@ class SlamFrontend:
         self.vis["robot"].set_transform(self.X_WB)
 
         # noise
-        self.sigma_odometry = 0.1
+        self.sigma_odometry = 0.05
         self.sigma_range = 0.05
         self.sigma_bearing = 0.05
         # von-mises distribution.

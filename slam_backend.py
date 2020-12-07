@@ -72,6 +72,10 @@ class SlamBackend:
         # weights/selection matrices for the cost function.
         self.M_u = np.ones(self.dim_l) * 0.1
 
+        self.beta = 0.15
+        self.alpha_LB = 0.6
+        self.is_uncertainty_reduction_only = False
+
     def update_landmark_measurements(
             self, t, idx_visible_l_list, d_l_measured_list, b_l_measured_list):
         """
@@ -485,6 +489,26 @@ class SlamBackend:
                 "predicted_uncertainty_L":
                     Cov_p_L[-self.dim_X:, -self.dim_X:].diagonal().sum()}
 
+    def calc_alpha(self, dX_WB, X_WB_e, l_xy_e):
+        I_k, _, _ = self.calc_info_matrix(X_WB_e, l_xy_e)
+        result_L = self.calc_inner_layer(dX_WB, l_xy_e, I_k)
+        Cov_p_L = inv(result_L["I_p"])
+
+        uncertainty_L = Cov_p_L[-self.dim_X:, -self.dim_X:].diagonal().sum()
+        alpha = min(1, uncertainty_L / self.beta)
+
+        if self.is_uncertainty_reduction_only:
+            if alpha < self.alpha_LB:
+                self.is_uncertainty_reduction_only = False
+            else:
+                alpha = 1
+        else:
+            # self.is_uncertainty_reduction_only == False
+            if alpha == 1:
+                self.is_uncertainty_reduction_only = True
+
+        return alpha
+
     def calc_objective_gradient(self, dX_WB, X_WB_e, l_xy_e, X_WB_g, alpha):
         """
         Algorithm 2 in the paper.
@@ -513,7 +537,7 @@ class SlamBackend:
 
         return Dc
 
-    def run_gradient_descent(self, dX_WB0, X_WB_e, l_xy_e, X_WB_g, alpha):
+    def run_gradient_descent(self, dX_WB0, X_WB_e, l_xy_e, X_WB_g, alpha=None):
         """
         Algorithm 1 in the paper.
         :return:
@@ -524,6 +548,9 @@ class SlamBackend:
         a = 0.4
         b = 0.5
         epsilon = 2e-3
+
+        if alpha is None:
+            alpha = self.calc_alpha(dX_WB, X_WB_e, l_xy_e)
 
         while True:
             D_dX_WB = self.calc_objective_gradient(
@@ -560,6 +587,7 @@ class SlamBackend:
             if is_cost_reduction_small or is_gradient_small or iter_count > 200:
                 break
 
+        print("alpha = {}".format(alpha), self.is_uncertainty_reduction_only)
         return dX_WB, result
 
     def initialize_dX_WB_with_goal(self, X_WB_0, X_WB_g, L, max_step=0.2):

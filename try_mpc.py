@@ -53,7 +53,7 @@ for i_goal, X_WB_g in enumerate(X_WB_goals):
     # Plan.
     dX_WB0 = backend.initialize_dX_WB_with_goal(X_WB_e[-1], X_WB_g, L)
     dX_WB, result = backend.run_gradient_descent(
-        dX_WB0, X_WB_e, l_xy_e, X_WB_g, alpha=alphas[i_goal])
+        dX_WB0, X_WB_e, l_xy_e, X_WB_g)
 
     # initial trajectory.
     X_WB0 = backend.calc_pose_predictions(dX_WB0)
@@ -89,7 +89,7 @@ for i_goal, X_WB_g in enumerate(X_WB_goals):
         X_WB_gt.append(X_WB.copy())
         i += 1
 
-    backend.draw_estimated_path_segment(L + 1, i_goal, covariance_scale=0.5)
+    backend.draw_estimated_path_segment(None, 0, covariance_scale=0.5)
     backend.draw_estimated_landmarks()
     # draw ground truth
     backend.draw_robot_path(
