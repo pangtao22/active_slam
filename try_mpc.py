@@ -1,3 +1,5 @@
+import time
+
 import numpy as np
 
 from slam_frontend import SlamFrontend
@@ -9,19 +11,6 @@ X_WB_goals = np.zeros((10, 2))
 X_WB_goals[:5, 1] = np.arange(1, 6)
 for i in range(5, 10):
     X_WB_goals[i] = X_WB_goals[i - 1] - 1
-# X_WB_goals[5:, 1] = np.arange(4, -1, -1)
-#
-# X_WB_goals = np.zeros((10, 2))
-# X_WB_goals[1, :2] = X_WB_goals[0, :2] + [0, 1.]
-# X_WB_goals[2, :2] = X_WB_goals[1, :2] + [-0.1, 0]
-# X_WB_goals[3, :2] = X_WB_goals[2, :2] + [-0.3, 0]
-# X_WB_goals[4, :2] = X_WB_goals[3, :2] + [-0.5, 0.5]
-# X_WB_goals[5, :2] = X_WB_goals[4, :2] + [-1, -0.2]
-# X_WB_goals[6, :2] = X_WB_goals[5, :2] + [-1, -1]
-# X_WB_goals[7, :2] = X_WB_goals[6, :2] + [0, 0.5]
-# X_WB_goals[8, :2] = X_WB_goals[7, :2] + [1.5, 2.5]
-# X_WB_goals[9, :2] = X_WB_goals[8, :2] + [1.5, -2]
-
 
 X_WB = np.zeros(2)
 X_WB_gt = [X_WB.copy()]
@@ -44,7 +33,9 @@ i += 1
 X_WB_e, l_xy_e = backend.run_bundle_adjustment(is_printing=False)
 
 #%% gradient descent in the loop
-L = 5
+start_time = time.time()
+
+L = 10
 alphas = np.zeros(len(X_WB_goals))
 alphas[5:] = 1
 
@@ -53,7 +44,7 @@ for i_goal, X_WB_g in enumerate(X_WB_goals):
     # Plan.
     dX_WB0 = backend.initialize_dX_WB_with_goal(X_WB_e[-1], X_WB_g, L)
     dX_WB, result = backend.run_gradient_descent(
-        dX_WB0, X_WB_e, l_xy_e, X_WB_g)
+        dX_WB0, X_WB_e, l_xy_e, X_WB_g, backprop=True)
 
     # initial trajectory.
     X_WB0 = backend.calc_pose_predictions(dX_WB0)
@@ -98,6 +89,6 @@ for i_goal, X_WB_g in enumerate(X_WB_goals):
 
     print("next?")
 
-
+print("--- %s seconds ---" % (time.time() - start_time))
 
 

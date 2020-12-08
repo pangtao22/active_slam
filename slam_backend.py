@@ -6,9 +6,10 @@ from pydrake.solvers.ipopt import IpoptSolver
 from pydrake.solvers.snopt import SnoptSolver
 from pydrake.solvers.gurobi import GurobiSolver
 import pydrake.solvers.mathematicalprogram as mp
-from pydrake.math import inv
+from pydrake.math import inv as inv_pydrake
 
 from slam_frontend import SlamFrontend, calc_angle_diff
+import torch
 
 
 class SlamBackend:
@@ -181,10 +182,14 @@ class SlamBackend:
         :param d_xy: X_WB - l_xy
         :return:
         """
-        d = np.sqrt((d_xy ** 2).sum())
-        d_xy /= d
-        J[i_row, j_start_x: j_start_x + 2] += d_xy / sigma
-        J[i_row, j_start_l: j_start_l + self.dim_l] += -d_xy / sigma
+        if torch.is_tensor(J):
+            norm = torch.norm
+        else:
+            norm = np.linalg.norm
+
+        d = norm(d_xy)
+        J[i_row, j_start_x: j_start_x + 2] = d_xy / (d * sigma)
+        J[i_row, j_start_l: j_start_l + self.dim_l] = -d_xy / (d * sigma)
 
         return d
 
@@ -198,10 +203,12 @@ class SlamBackend:
         dy = yl - yb
         d_arctan_D_dx = 1 / (1 + (dy / dx) ** 2) * (-dy / dx ** 2)
         d_arctan_D_dy = 1 / (1 + (dy / dx) ** 2) * (1 / dx)
-        d_arctan_D_dxy = np.array([d_arctan_D_dx, d_arctan_D_dy])
 
-        J[i_row, j_start_x: j_start_x + 2] += -d_arctan_D_dxy / sigma
-        J[i_row, j_start_l: j_start_l + self.dim_l] += d_arctan_D_dxy / sigma
+        J[i_row, j_start_x] = -d_arctan_D_dx / sigma
+        J[i_row, j_start_x + 1] = -d_arctan_D_dy / sigma
+
+        J[i_row, j_start_l] = d_arctan_D_dx / sigma
+        J[i_row, j_start_l + 1] = d_arctan_D_dy / sigma
 
         return dx, dy
 
@@ -232,6 +239,7 @@ class SlamBackend:
 
         n_rows = (n_o + 1) * dim_X + nl_measurements * self.dim_measurements
         n_cols = (n_o + 1) * dim_X + nl * dim_l
+
         J = np.zeros((n_rows, n_cols))
         b = np.zeros(n_rows)
         sigmas = np.zeros(n_rows)
@@ -328,31 +336,45 @@ class SlamBackend:
         n_cols = l * self.dim_X + n_Xk
 
         # F_whitened is devided by sigma_w.
-        F_whitened = np.zeros((n_rows_F, n_cols), dtype=dX_WB.dtype)
-        # H is the original Jacobian, before divided by sigma_v.
-        H = np.zeros((n_rows_H, n_cols), dtype=dX_WB.dtype)
-        # as defined in Eq. (33)
-        Omega_v_bar_sqrt = np.zeros(n_rows_H)
-        Omega_v_sqrt = np.zeros(n_rows_H)
+        if torch.is_tensor(dX_WB):
+            F_whitened = torch.zeros((n_rows_F, n_cols))
+            # H is the original Jacobian, before divided by sigma_v.
+            H = torch.zeros((n_rows_H, n_cols))
+            # as defined in Eq. (33)
+            Omega_v_bar_sqrt = torch.zeros(n_rows_H)
+            Omega_v_sqrt = torch.zeros(n_rows_H)
+            I_X = torch.eye(self.dim_X)
+
+            l_xy_e = torch.from_numpy(l_xy_e)
+            norm = torch.norm
+            vstack = torch.vstack
+        else:
+            F_whitened = np.zeros((n_rows_F, n_cols), dtype=dX_WB.dtype)
+            H = np.zeros((n_rows_H, n_cols), dtype=dX_WB.dtype)
+            Omega_v_bar_sqrt = np.zeros(n_rows_H)
+            Omega_v_sqrt = np.zeros(n_rows_H)
+
+            I_X = np.eye(self.dim_X)
+            norm = np.linalg.norm
+            vstack = np.vstack
 
         # dynamics, F_whitened.
         for i in range(l):
             i0 = i * self.dim_X
             i1 = i0 + self.dim_X
 
-            F_whitened[i0: i1, n_Xk + i0: n_Xk + i1] = \
-                np.eye(self.dim_X) / self.sigma_dynamics
+            F_whitened[i0: i1, n_Xk + i0: n_Xk + i1] = I_X / self.sigma_dynamics
 
             if i == 0:
                 j0 = (n_p - 1) * self.dim_X
                 j1 = n_p * self.dim_X
                 F_whitened[i0: i1, j0: j1] = \
-                    -np.eye(self.dim_X) / self.sigma_dynamics
+                    -I_X / self.sigma_dynamics
             else:
                 j0 = n_Xk + i0 - self.dim_X
                 j1 = n_Xk + i1 - self.dim_X
                 F_whitened[i0: i1, j0: j1] = \
-                    -np.eye(self.dim_X) / self.sigma_dynamics
+                    -I_X / self.sigma_dynamics
 
         # observations, H.
         i_row = 0
@@ -362,14 +384,13 @@ class SlamBackend:
                 j_start_x = n_Xk + i * self.dim_X
                 j_start_l = n_p * self.dim_X + idx_j * self.dim_l
 
-                self.calc_range_derivatives(
+                d = self.calc_range_derivatives(
                     H, i_row, j_start_x, j_start_l, d_xy, sigma=1)
 
                 self.calc_bearing_derivatives(
                     H, i_row + 1, j_start_x, j_start_l,
                     X_WB_p[i], l_xy_e[idx_j], sigma=1)
 
-                d = np.linalg.norm(d_xy)
                 if d > 5 * self.r_range_max:
                     p_visible = 0.
                 else:
@@ -384,7 +405,7 @@ class SlamBackend:
 
         # A2 is the lower half of \mathcal{A} in Eq. (32),
         #   i.e. [F_whitened; H / Omega_v_sqrt].
-        A2 = np.vstack([F_whitened, (H.T * Omega_v_bar_sqrt).T])
+        A2 = vstack([F_whitened, (H.T * Omega_v_bar_sqrt).T])
 
         return {"A2": A2, "X_WB_p": X_WB_p, "H": H, "F_whitened": F_whitened,
                 "Omega_v_bar_sqrt": Omega_v_bar_sqrt,
@@ -399,6 +420,9 @@ class SlamBackend:
         :param I_Xk: information matrix of current trajetory and landmarks.
         :return:
         """
+        if torch.is_tensor(dX_WB):
+            I_Xk = torch.from_numpy(I_Xk)
+
         n_Xk = I_Xk.shape[0]  # size of states up to now.
 
         def calc_I(A2, dtype):
@@ -409,11 +433,18 @@ class SlamBackend:
             A22 = A2[:, n_Xk:]
 
             # I_X{k+l} = A.T.dot(A)
-            I = np.zeros((n_X, n_X), dtype=dtype)
-            I[:n_Xk, :n_Xk] = I_Xk + A21.T.dot(A21)
-            I[:n_Xk, n_Xk:] = A21.T.dot(A22)
+            if torch.is_tensor(A2):
+                I = torch.zeros((n_X, n_X))
+                I[:n_Xk, :n_Xk] = I_Xk + torch.mm(A21.T, A21)
+                I[n_Xk:, n_Xk:] = torch.mm(A22.T, A22)
+                I[:n_Xk, n_Xk:] = torch.mm(A21.T, A22)
+            else:
+                I = np.zeros((n_X, n_X), dtype=dtype)
+                I[:n_Xk, :n_Xk] = I_Xk + A21.T.dot(A21)
+                I[n_Xk:, n_Xk:] = A22.T.dot(A22)
+                I[:n_Xk, n_Xk:] = A21.T.dot(A22)
+
             I[n_Xk:, :n_Xk] = I[:n_Xk, n_Xk:].T
-            I[n_Xk:, n_Xk:] = A22.T.dot(A22)
 
             return I
 
@@ -428,10 +459,15 @@ class SlamBackend:
 
     def calc_pose_predictions(self, dX_WB):
         L = len(dX_WB)
-        # robot configuration for time steps k + 1 : (k + L).
-        X_WB_p = np.zeros((L, self.dim_X), dtype=dX_WB.dtype)
         k = len(self.X_WB_e_dict) - 1   # current time step.
-        X_WB_e_k = self.X_WB_e_dict[k]
+
+        # robot configuration for time steps k + 1 : (k + L).
+        if torch.is_tensor(dX_WB):
+            X_WB_p = torch.zeros((L, self.dim_X))
+            X_WB_e_k = torch.from_numpy(self.X_WB_e_dict[k])
+        else:
+            X_WB_p = np.zeros((L, self.dim_X), dtype=dX_WB.dtype)
+            X_WB_e_k = self.X_WB_e_dict[k]
 
         for i in range(L):
             if i == 0:
@@ -441,6 +477,13 @@ class SlamBackend:
 
         return X_WB_p
 
+    @staticmethod
+    def get_inverse(x):
+        if torch.is_tensor(x):
+            return torch.inverse
+        else:
+            return inv_pydrake
+
     def calc_objective(self, dX_WB, X_WB_e, l_xy_e, X_WB_g, alpha):
         """
         Algorithm 3 in the paper.
@@ -449,8 +492,16 @@ class SlamBackend:
         L = len(dX_WB)
         I_k, _, _ = self.calc_info_matrix(X_WB_e, l_xy_e)
 
+        if torch.is_tensor(dX_WB):
+            M_u = torch.from_numpy(self.M_u)
+            X_WB_g = torch.from_numpy(X_WB_g)
+        else:
+            M_u = self.M_u
+
+        inv = self.get_inverse(dX_WB)
+
         # (a) in eq. (41).
-        c_a = (dX_WB * self.M_u * dX_WB).sum()
+        c_a = (dX_WB * M_u * dX_WB).sum()
 
         # (b) in eq. (41).
         c_b = 0.
@@ -475,13 +526,23 @@ class SlamBackend:
         # B.shape = (self.dim_X, m2),
         #   where m2 is the number of range and bearing measurements of
         #   the trajectory X_WB_p_L.
-        B = Cov_e_L[-self.dim_X:].dot(H_whitened_kL.T) * Omega_v_bar_sqrt
-        Q_kL = B.T.dot(B)
+        if torch.is_tensor(dX_WB):
+            B = torch.mm(
+                Cov_e_L[-self.dim_X:], H_whitened_kL.T) * Omega_v_bar_sqrt
+            Q_kL = torch.mm(B.T, B)
+            D = torch.mm(torch.mm(H_kL, Cov_p_L), H_kL.T)
 
-        D = H_kL.dot(Cov_p_L).dot(H_kL.T)
+        else:
+            B = Cov_e_L[-self.dim_X:].dot(H_whitened_kL.T) * Omega_v_bar_sqrt
+            Q_kL = B.T.dot(B)
+            D = H_kL.dot(Cov_p_L).dot(H_kL.T)
+
         D[np.diag_indices_from(D)] += 1 / Omega_v_sqrt ** 2
 
-        c_c2 = Q_kL.dot(D).diagonal().sum()
+        if torch.is_tensor(dX_WB):
+            c_c2 = torch.mm(Q_kL, D).diagonal().sum()
+        else:
+            c_c2 = Q_kL.dot(D).diagonal().sum()
 
         c = c_a + alpha * (c_b * 50) + (1 - alpha) * (c_c1 + c_c2)
         # c = alpha * (c_b) + (1 - alpha) * (c_c1)
@@ -490,6 +551,7 @@ class SlamBackend:
                     Cov_p_L[-self.dim_X:, -self.dim_X:].diagonal().sum()}
 
     def calc_alpha(self, dX_WB, X_WB_e, l_xy_e):
+        inv = self.get_inverse(dX_WB)
         I_k, _, _ = self.calc_info_matrix(X_WB_e, l_xy_e)
         result_L = self.calc_inner_layer(dX_WB, l_xy_e, I_k)
         Cov_p_L = inv(result_L["I_p"])
@@ -509,7 +571,8 @@ class SlamBackend:
 
         return alpha
 
-    def calc_objective_gradient(self, dX_WB, X_WB_e, l_xy_e, X_WB_g, alpha):
+    def calc_objective_gradient_finite_difference(
+            self, dX_WB, X_WB_e, l_xy_e, X_WB_g, alpha):
         """
         Algorithm 2 in the paper.
         :param dX_WB:
@@ -537,12 +600,15 @@ class SlamBackend:
 
         return Dc
 
-    def run_gradient_descent(self, dX_WB0, X_WB_e, l_xy_e, X_WB_g, alpha=None):
+    def run_gradient_descent(self, dX_WB0, X_WB_e, l_xy_e, X_WB_g, alpha=None,
+                             backprop=True):
         """
         Algorithm 1 in the paper.
         :return:
         """
         dX_WB = dX_WB0.copy()
+        dX_WB_torch = torch.from_numpy(dX_WB)
+        dX_WB_torch.requires_grad_()
         iter_count = 0
 
         a = 0.4
@@ -553,11 +619,23 @@ class SlamBackend:
             alpha = self.calc_alpha(dX_WB, X_WB_e, l_xy_e)
 
         while True:
-            D_dX_WB = self.calc_objective_gradient(
-                dX_WB, X_WB_e, l_xy_e, X_WB_g, alpha)
-            result = self.calc_objective(
-                dX_WB, X_WB_e, l_xy_e, X_WB_g, alpha)
-            c0 = result["c"]
+            if backprop:
+                if dX_WB_torch.grad is not None:
+                    dX_WB_torch.grad.data.zero_()
+                result = self.calc_objective(
+                    dX_WB_torch, X_WB_e, l_xy_e, X_WB_g, alpha)
+                c0 = result["c"]
+                c0.backward()
+                D_dX_WB = dX_WB_torch.grad.numpy()
+
+                result = self.convert_cost_from_torch_tensor_to_float(result)
+            else:
+                result = self.calc_objective(
+                    dX_WB, X_WB_e, l_xy_e, X_WB_g, alpha)
+                D_dX_WB = self.calc_objective_gradient_finite_difference(
+                    dX_WB, X_WB_e, l_xy_e, X_WB_g, alpha)
+                c0 = result["c"]
+
             print("\nIteration {}, cost \n".format(iter_count), result)
 
             # line search
@@ -589,6 +667,13 @@ class SlamBackend:
 
         print("alpha = {}".format(alpha), self.is_uncertainty_reduction_only)
         return dX_WB, result
+
+    @staticmethod
+    def convert_cost_from_torch_tensor_to_float(result):
+        result_no_torch = dict()
+        for key, value in result.items():
+            result_no_torch[key] = float(value)
+        return result_no_torch
 
     def initialize_dX_WB_with_goal(self, X_WB_0, X_WB_g, L, max_step=0.2):
         """
@@ -695,7 +780,7 @@ class SlamBackend:
             X_WB_ellipsoid[:2, 3] = X_WB_e
             sigmas = np.sqrt(e_values)
             self.X_WB_e_var_dict[i] = {
-                "sigmas": np.hstack([sigmas, 0.01]),
+                "sigmas": np.hstack([np.real(sigmas), 0.01]),
                 "transform": X_WB_ellipsoid,
                 "cov": Cov_i}
 
@@ -791,6 +876,3 @@ class SlamBackend:
             self.vis[prefix][str(idx_segment)]["path"][str(i)].set_object(
                 meshcat.geometry.Line(
                     meshcat.geometry.PointsGeometry(points.T)))
-
-
-
