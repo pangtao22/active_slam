@@ -22,7 +22,8 @@ def calc_angle_sum(angle1, angle2):
 def set_orthographic_camera_xy(vis: meshcat.Visualizer):
     # use orthographic camera, show xy plane.
     camera = meshcat.geometry.OrthographicCamera(
-        left=-5, right=5, bottom=-5, top=5, near=-1000, far=1000)
+        # left=-5, right=5, bottom=-5, top=5, near=-1000, far=1000)
+        left=-9, right=5, bottom=-1.5, top=5, near=-1000, far=1000)
     vis['/Cameras/default/rotated'].set_object(camera)
     vis['/Cameras/default/rotated/<object>'].set_property(
         "position", [0, 0, 0])
@@ -31,20 +32,21 @@ def set_orthographic_camera_xy(vis: meshcat.Visualizer):
 
 
 class SlamFrontend:
-    def __init__(self, num_landmarks: int, seed: int):
+    def __init__(self, num_landmarks: int, seed: int,
+                 bbox_length=1., landmarks_offset=(0, 0)):
         random.seed(seed)
 
         self.nl = num_landmarks
         # edge length of the square in which the robot runs.
-        bbox_length = 1
+        bbox_length = bbox_length
         self.box_length = bbox_length
 
         self.r_range_max = 1
         self.r_range_min = 0.2
 
         # coordinates of landmarks.
-        self.l_xy = random.rand(self.nl, 2) * bbox_length - bbox_length / 2
-                    # np.array([-1.5, 1.3])
+        self.l_xy = (random.rand(self.nl, 2) * bbox_length - bbox_length / 2 +
+                     np.array(landmarks_offset))
         # self.l_xy = np.array([[0, 0.5], [-0.6, 0.1], [-0.7, -0.2]])
 
         # visualizer
@@ -68,7 +70,7 @@ class SlamFrontend:
             meshcat.geometry.Cylinder(height=0.005, radius=self.r_range_max),
             material1)
         self.vis["robot"]["body"].set_object(
-            meshcat.geometry.Cylinder(height=0.2, radius=0.075),
+            meshcat.geometry.Cylinder(height=0.2, radius=0.04),
             material0)
         self.vis["robot"].set_transform(self.X_WB)
 
@@ -87,10 +89,19 @@ class SlamFrontend:
         X[:2, 3] = p
         self.vis[prefix].set_transform(X)
 
+    def draw_cylinder(self, prefix, radius, height, color, p):
+        self.vis[prefix].set_object(
+            meshcat.geometry.Cylinder(radius=radius, height=height),
+            meshcat.geometry.MeshLambertMaterial(color=color))
+        X = meshcat.transformations.rotation_matrix(np.pi/2, [1, 0, 0])
+        X[:2, 3] = p
+        self.vis[prefix].set_transform(X)
+
     def draw_landmarks(self):
         for i, l_xy_i in enumerate(self.l_xy):
             prefix = "landmarks/{}".format(i)
-            self.draw_box(prefix, [0.1, 0.1, 0.1], 0x0000ff, l_xy_i)
+            self.draw_cylinder(
+                prefix, 0.05, 0.05, 0x0000ff, l_xy_i)
 
     def get_true_landmark_positions(self, landmark_idx):
         return self.l_xy[landmark_idx]

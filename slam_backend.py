@@ -545,7 +545,7 @@ class SlamBackend:
             c_c2 = Q_kL.dot(D).diagonal().sum()
 
         c = c_a + alpha * (c_b * 50) + (1 - alpha) * (c_c1 + c_c2)
-        # c = alpha * (c_b) + (1 - alpha) * (c_c1)
+        # c = c_c1
         return {"c": c, "c_a": c_a, "c_b": c_b, "c_c1": c_c1, "c_c2": c_c2,
                 "predicted_uncertainty_L":
                     Cov_p_L[-self.dim_X:, -self.dim_X:].diagonal().sum()}
@@ -565,11 +565,10 @@ class SlamBackend:
             else:
                 alpha = 1
         else:
-            # self.is_uncertainty_reduction_only == False
             if alpha == 1:
                 self.is_uncertainty_reduction_only = True
 
-        return alpha
+        return float(alpha)
 
     def calc_objective_gradient_finite_difference(
             self, dX_WB, X_WB_e, l_xy_e, X_WB_g, alpha):
@@ -666,6 +665,7 @@ class SlamBackend:
                 break
 
         print("alpha = {}".format(alpha), self.is_uncertainty_reduction_only)
+        result["alpha"] = alpha
         return dX_WB, result
 
     @staticmethod
@@ -791,6 +791,13 @@ class SlamBackend:
 
         self.I_all = I_all
 
+    def calc_sqrt_postion_cov_trace(self):
+        postion_cov_trace = 0.
+        for a in self.X_WB_e_var_dict.values():
+            postion_cov_trace += a["cov"].diagonal().sum()
+
+        return np.sqrt(postion_cov_trace)
+
     def find_visible_landmarks(self, X_WB_p):
         future_landmark_measurements = dict()
         for i, X_WB in enumerate(X_WB_p):
@@ -819,7 +826,7 @@ class SlamBackend:
         n_p = len(self.X_WB_e_dict)
         name = "robot_poses_e/{}".format(idx_segment)
         material = meshcat.geometry.MeshLambertMaterial(
-            color=0xffffff, opacity=0.5)
+            color=0x778899, opacity=0.5)
 
         if L is None:
             L = n_p
@@ -857,19 +864,17 @@ class SlamBackend:
 
             # draw landmark
             prefix = "landmarks_e/points/{}".format(i)
-            self.frontend.draw_box(
-                prefix, [0.1, 0.1, 0.11], 0x00ffff, l_xy_e_i)
+            self.frontend.draw_cylinder(
+                prefix, 0.05, 0.11, 0x00ffff, l_xy_e_i)
 
     def draw_robot_path(self, X_WBs, color, prefix: str,
                         idx_segment: int, size=0.2):
         t_xy = X_WBs[:, :2]
-        for i in range(0, len(t_xy)):
+        for i in range(1, len(t_xy)):
             name = prefix + "/{}/points/{}".format(idx_segment, i)
             self.frontend.draw_box(
                 name, [size, size, 0.15], color, t_xy[i])
 
-            if i == 0:
-                continue
             points = np.zeros((2, 3))
             points[0, :2] = t_xy[i - 1]
             points[1, :2] = t_xy[i]
